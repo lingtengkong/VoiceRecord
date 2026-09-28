@@ -92,7 +92,9 @@ class LiveEngine:
         self.folder, self.model = folder, model
         self.language, self.vocabulary = language, vocabulary
         self.on_event = on_event or emit
-        self.tracks = {key: Track(key) for key in SOURCES}
+        from .sources import audio_sources
+        self.sources = audio_sources(folder)
+        self.tracks = {key: Track(key) for key in self.sources}
         self.rows = []
         self.skipped = []
         self.last_checkpoint = 0.0
@@ -124,7 +126,7 @@ class LiveEngine:
                 # Keep preview live instead of growing an unbounded RAM/job queue.
                 # Report every skipped range; full audio stays available for redo.
                 start = max(track.cursor, available-8)
-                missing = {"source": SOURCES[key], "start": track.cursor, "end": start}
+                missing = {"source": self.sources[key], "start": track.cursor, "end": start}
                 self.skipped.append(missing)
                 track.cursor = start
                 track.seen = start
@@ -171,7 +173,7 @@ class LiveEngine:
                     if ends:
                         cut = max(ends)
                 result = rows_from_segments(segments, left, track.cursor,
-                                            cut if finalize else end, SOURCES[key])
+                                            cut if finalize else end, self.sources[key])
             else:
                 result = []
                 # Keep a short undecided tail so a very brief new word can acquire context.
@@ -189,7 +191,7 @@ class LiveEngine:
             else:
                 track.partial = result
             self.changed = True
-            self.on_event("live_partial", source=SOURCES[key], rows=track.partial,
+            self.on_event("live_partial", source=self.sources[key], rows=track.partial,
                           processed_until=end, inference_seconds=round(time.monotonic()-started, 3))
         self.checkpoint()
 

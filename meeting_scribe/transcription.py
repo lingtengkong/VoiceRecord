@@ -44,19 +44,27 @@ def emit(kind: str, **kwargs) -> None:
 def export_transcript(folder: Path, rows: list[dict], metadata: dict) -> Path:
     rows = sorted(rows, key=lambda r: (r["start"], r["end"]))
     live = metadata.get("mode") == "live"
-    destination = folder / ("live_transcripts" if live else "transcripts") / (datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+    diarized = metadata.get("diarized", False)
+    destination = folder / ("speaker_transcripts" if diarized else "live_transcripts" if live else "transcripts") / (datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     destination.mkdir(parents=True)
     title = read_json(folder / "session.json").get("title", folder.name)
     lines = [f"# {title}", "", "本地语音识别初稿；请核对姓名、数字、专业术语和关键决定。",
              "“我 / 麦克风”和“会议声音”是音源标签，不代表已识别每位参会者。", ""]
     if live:
-        lines.insert(2, "【Turbo 实时草稿】可在会后使用 large-v3 重新转写，草稿与会后稿分别保留。")
+        engine = 'Nemotron 3.5' if metadata.get('model') == 'nemotron-3.5-asr' else 'Turbo'
+        lines.insert(2, f"【{engine} 实时草稿】可在会后使用 large-v3 重新转写，草稿与会后稿分别保留。")
+        if metadata.get('live_replay'):
+            lines.insert(3,'【回放重建】使用保存的原音轨重跑流式算法生成，不是当时显示内容的逐帧记录。')
+        if metadata.get('speaker_diarization'):
+            lines.insert(3, '【待核对】实时说话者为自动编号，可能变化；时间戳为流式解码近似位置，多人重叠可能漏词。')
         if not metadata.get("complete", False):
             lines.insert(3, "【未完成】" + metadata.get("reason", "实时预览提前结束，后续内容请会后重转。"))
         if metadata.get("skipped_ranges"):
             lines.insert(3, "【需会后重转】实时识别曾积压，以下范围未包含在草稿中：" + "；".join(
                 f'{gap["source"]} {timestamp(gap["start"])}–{timestamp(gap["end"])}'
                 for gap in metadata["skipped_ranges"]))
+    if diarized:
+        lines.insert(2, "【Nemotron 说话者标签 · 待核对】编号仅在本次录音内有效，可能合并或变化，不代表真实姓名。本机麦克风可能录到身边其他人。多位参会者标签表示该句涵盖多人的发言，不保证逐字归属。")
     srt = []
     for i, row in enumerate(rows, 1):
         lines.append(f'[{timestamp(row["start"])} → {timestamp(row["end"])}] {row["source"]}：{row["text"]}')
@@ -72,7 +80,7 @@ def export_transcript(folder: Path, rows: list[dict], metadata: dict) -> Path:
               "将提议与已确认决定分开。转写可能有错，遇到可疑数字或术语请标出待核实。\n"
               "“会议声音”可能包含多位参会者，不能据此断言他们是同一个人。\n\n---\n\n")
     (destination / "summary_input.md").write_text(prompt + text, encoding="utf-8")
-    atomic_json(folder / ("latest_live_transcript.json" if live else "latest_transcript.json"),
+    atomic_json(folder / ("latest_speaker_transcript.json" if diarized else "latest_live_transcript.json" if live else "latest_transcript.json"),
                 {"path": str(destination), "metadata": metadata})
     return destination
 
@@ -93,7 +101,8 @@ def transcribe_session(folder: Path, model_name: str, language: str, device: str
     compute_type = "int8_float16" if device == "cuda" else "int8"
     model = WhisperModel(str(model_path(model_name)), device=device, compute_type=compute_type,
                          local_files_only=True, cpu_threads=4, num_workers=1)
-    files = [(folder / "microphone.wav", "我 / 麦克风"), (folder / "system.wav", "会议声音")]
+    from .sources import audio_sources
+    files = [(folder / f'{key}.wav', label) for key,label in audio_sources(folder).items()]
     files = [(p, label) for p, label in files if p.exists()]
     if not files:
         raise RuntimeError("没有找到可转写的录音。")
@@ -145,7 +154,9 @@ def transcribe_session(folder: Path, model_name: str, language: str, device: str
                         row = {"start": round(left + words[0].start, 3),
                                "end": round(left + words[-1].end, 3), "source": label,
                                "text": "".join(w.word for w in words).strip(),
-                               "language": info.language}
+                               "language": info.language,
+                               "words": [{"start": round(left+w.start,3), "end": round(left+w.end,3),
+                                          "text": w.word} for w in words]}
                         if row["text"]:
                             rows.append(row)
                             emit("segment", **row)

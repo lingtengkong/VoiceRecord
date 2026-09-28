@@ -161,9 +161,11 @@ class TrackWriter:
 
 
 class Recorder:
-    def __init__(self, folder: Path, microphone: Device, system: Device):
+    def __init__(self, folder: Path, microphone: Device, system: Device | None):
         self.folder = folder
-        self.devices = {"microphone": microphone, "system": system}
+        self.devices = {"microphone": microphone}
+        if system is not None:
+            self.devices['system'] = system
         self.engine = None
         self.streams = {}
         self.writers = {}
@@ -177,6 +179,7 @@ class Recorder:
         self.error = ""
         self.active = False
         self.meta = read_json(folder / "session.json")
+        self.meta['capture_mode'] = 'dual' if system is not None else 'microphone_only'
         self.last_save = 0.0
         self.last_live = 0.0
         self.pause_boundaries = []

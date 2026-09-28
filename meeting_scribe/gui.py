@@ -8,24 +8,32 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QProcess, QProcessEnvironment, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
+from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QComboBox, QProgressBar, QFrame, QListWidget, QListWidgetItem,
-    QPlainTextEdit, QMessageBox, QCheckBox, QSplitter, QSizePolicy, QScrollArea, QLayout, QFileDialog,
+    QPlainTextEdit, QMessageBox, QCheckBox, QSplitter, QSizePolicy, QScrollArea, QLayout, QFileDialog, QDialog,
 )
 
 from .audio import Recorder, list_devices, recover_session
+from .branding import ICON_PATH, WINDOW_TITLE
+from .summary import session_summary, summary_headline
 from .storage import data_root, new_session, read_json, atomic_json, sessions, timestamp
 from .storage import recordings_root, set_recordings_root
 from .transcription import MODELS, model_ready, export_transcript
 from .transcript_view import TranscriptView
+from .playback import Playback
+from .diarization import runtime_path as diarization_runtime, model_path as diarization_model
+from .diarization import save_manual
+from .nemotron_stream import asr_path as nemotron_asr_path
 
 PROJECT = Path(__file__).resolve().parent.parent
 
 STYLE = """
 QWidget { font-family: 'Microsoft YaHei UI', 'Segoe UI'; font-size: 13px; color: #213348; }
 QMainWindow, #root { background: #f1f5f8; }
+QDialog, QMessageBox { background-color: #f1f5f8; color: #213348; }
+QDialog QLabel, QMessageBox QLabel { background-color: transparent; color: #213348; }
 #settings, QScrollArea { background: #f1f5f8; border: none; }
 #settings QWidget { font-size: 12px; }
 #settings QLineEdit, #settings QComboBox { padding: 5px; }
@@ -114,7 +122,8 @@ class MainWindow(QMainWindow):
             if path.exists():
                 QFontDatabase.addApplicationFont(str(path))
         QApplication.instance().setFont(QFont("Microsoft YaHei", 10))
-        self.setWindowTitle("本地会议录音 · Meeting Scribe")
+        self.setWindowTitle(WINDOW_TITLE)
+        self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.resize(1180, 920)
         self.setMinimumSize(1000, 760)
         self.recorder = None
@@ -141,10 +150,12 @@ class MainWindow(QMainWindow):
         self.live_last_event = 0.
         self.live_cancelled = False
         self.pending_auto = False
+        self.summary_cancel = None
         self.settings_path = data_root() / "settings.json"
         self.settings = read_json(self.settings_path)
         self.setStyleSheet(STYLE)
         self._build()
+        self.capture_mode_changed()
         self.refresh_devices()
         self.refresh_history(recover=recover_sessions)
         self.timer = QTimer(self)
@@ -190,6 +201,14 @@ class MainWindow(QMainWindow):
         self.choose_folder_button = button("选择文件夹", self.choose_recordings_folder)
         destination_row.addWidget(self.choose_folder_button)
         layout.addLayout(destination_row)
+        self.capture_mode = QComboBox()
+        self.capture_mode.addItem('双路录音 · 麦克风＋电脑声音', 'dual')
+        self.capture_mode.addItem('仅录麦克风 · 含外放会议声音', 'microphone_only')
+        self.capture_mode.setCurrentIndex(max(0,self.capture_mode.findData(self.settings.get('capture_mode','dual'))))
+        layout.addWidget(self.capture_mode)
+        self.capture_hint = label('', 'hint')
+        layout.addWidget(self.capture_hint)
+        self.capture_mode.currentIndexChanged.connect(self.capture_mode_changed)
         layout.addWidget(label("我的麦克风", "muted"))
         self.mic_combo = QComboBox()
         self.mic_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -198,7 +217,8 @@ class MainWindow(QMainWindow):
         self.mic_meter.setTextVisible(False)
         self.mic_meter.setFixedHeight(7)
         layout.addWidget(self.mic_meter)
-        layout.addWidget(label("会议声音 · 选择会议正在使用的耳机 / 扬声器", "muted"))
+        self.system_label = label("会议声音 · 选择会议正在使用的耳机 / 扬声器", "muted")
+        layout.addWidget(self.system_label)
         self.system_combo = QComboBox()
         self.system_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         layout.addWidget(self.system_combo)
@@ -224,18 +244,22 @@ class MainWindow(QMainWindow):
         for b in (self.start_button, self.pause_button, self.stop_button):
             buttons.addWidget(b)
         layout.addLayout(buttons)
-        self.live_enabled = QCheckBox("边录边转写 · Turbo（GPU）")
+        self.live_enabled = QCheckBox("边录边转写（GPU）")
         self.live_enabled.setChecked(self.settings.get("live_enabled", True))
         layout.addWidget(self.live_enabled)
+        self.live_engine = QComboBox()
+        self.live_engine.addItem('Nemotron 3.5 · 实时文字＋说话者', 'nemotron')
+        self.live_engine.setCurrentIndex(0)
+        layout.addWidget(self.live_engine)
         self.live_status = label("实时转写在本机运行；临时文字会随上下文修订。", "hint")
         layout.addWidget(self.live_status)
-        self.auto_transcribe = QCheckBox("结束后用下方所选模型重新转写")
-        self.auto_transcribe.setChecked(self.settings.get("auto_transcribe", False))
+        self.auto_transcribe = QCheckBox("结束后用下方模型转写并生成摘要")
+        self.auto_transcribe.setChecked(self.settings.get("auto_summary", True))
         layout.addWidget(self.auto_transcribe)
 
         transcript, layout = card()
         left_layout.addWidget(transcript)
-        layout.addWidget(label("02  本地转写", "section"))
+        layout.addWidget(label("02  本地转写与摘要", "section"))
         options = QHBoxLayout()
         self.model_combo = QComboBox()
         self.model_combo.addItem("large-v3 · 精度优先", "large-v3")
@@ -254,20 +278,25 @@ class MainWindow(QMainWindow):
         self.vocabulary.setPlaceholderText("可选术语提示：人名、公司名、技术缩写，用逗号分隔")
         self.vocabulary.setText(self.settings.get("vocabulary", ""))
         layout.addWidget(self.vocabulary)
+        layout.addWidget(label("摘要模型", "muted"))
+        self.summary_model = QComboBox()
+        self.summary_model.addItem("Qwen3.5 · 4B（默认）", "qwen3.5:4b")
+        self.summary_model.addItem("Qwen3.5 · 9B（显存占用较高）", "qwen3.5:9b")
+        self.summary_model.setCurrentIndex(max(0,self.summary_model.findData(self.settings.get("summary_model","qwen3.5:4b"))))
+        layout.addWidget(self.summary_model)
         actions = QHBoxLayout()
-        self.transcribe_button = button("转写录音", self.start_transcription, "primary")
-        self.download_button = button("下载模型", self.download_model)
+        self.transcribe_button = button("转写＋摘要", self.start_transcription, "primary")
         self.cancel_button = button("取消", self.cancel_process)
-        for b in (self.transcribe_button, self.download_button, self.cancel_button):
-            actions.addWidget(b)
+        actions.addWidget(self.transcribe_button, 2)
+        actions.addWidget(self.cancel_button, 1)
         layout.addLayout(actions)
-        self.model_status = label("", "muted")
-        layout.addWidget(self.model_status)
         self.progress = QProgressBar()
         self.progress.setValue(0)
         self.progress.setFixedHeight(14)
         layout.addWidget(self.progress)
-        self.job_status = label("模型准备好后，可断网转写。原始录音不会上传。", "hint")
+        self.model_status = label("", "muted")
+        layout.addWidget(self.model_status)
+        self.job_status = label("自动转写、区分说话者并生成摘要；摘要需启动本机 Ollama。", "hint")
         layout.addWidget(self.job_status)
         left_layout.addStretch()
         for field in (self.title_edit, self.mic_combo, self.system_combo, self.model_combo,
@@ -298,6 +327,8 @@ class MainWindow(QMainWindow):
         row.addWidget(label("会议记录", "section"))
         row.addStretch()
         row.addWidget(button("打开保存目录", lambda: self.open_path(recordings_root())))
+        self.folder_button = button("打开本次文件夹", self.open_session)
+        row.addWidget(self.folder_button)
         layout.addLayout(row)
         self.history = QListWidget()
         self.history.setMinimumHeight(60)
@@ -307,23 +338,22 @@ class MainWindow(QMainWindow):
         self.history.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self.history.currentItemChanged.connect(self.select_session)
         layout.addWidget(self.history, 1)
-        self.session_info = label("开始一次录音后，会在这里保留音频和转写稿。", "muted")
+        self.session_info = label("", "muted")
+        self.session_info.hide()
         layout.addWidget(self.session_info)
-        actions = QHBoxLayout()
-        self.play_button = button("回听录音", self.play_recording)
-        self.folder_button = button("打开本次文件夹", self.open_session)
-        actions.addWidget(self.play_button)
-        actions.addWidget(self.folder_button)
-        layout.addLayout(actions)
         preview, layout = card()
         right_layout.addWidget(preview, 3)
-        layout.addWidget(label("03  实时草稿与会后稿", "section"))
+        layout.addWidget(label("03  转写与摘要", "section"))
         self.version_combo = QComboBox()
         self.version_combo.addItem("会后稿（优先）", "final")
-        self.version_combo.addItem("Turbo 实时草稿", "live")
+        self.version_combo.addItem("实时草稿", "live")
+        self.version_combo.addItem("说话者标注稿（待核对）", "speakers")
+        self.version_combo.addItem("会后摘要", "summary")
         self.version_combo.currentIndexChanged.connect(self.show_selected_transcript)
         version_row = QHBoxLayout()
         version_row.addWidget(self.version_combo, 1)
+        self.edit_speaker_button = button("修改说话者", self.edit_speaker)
+        version_row.addWidget(self.edit_speaker_button)
         version_row.addWidget(button("回到最新", lambda: self.preview.verticalScrollBar().setValue(
             self.preview.verticalScrollBar().maximum())))
         layout.addLayout(version_row)
@@ -331,6 +361,14 @@ class MainWindow(QMainWindow):
         self.preview.setReadOnly(True)
         self.preview.setPlaceholderText("转写完成后，在这里查看带时间戳的文字。\n\n保留音源标签：\n• 我 / 麦克风\n• 会议声音（可能包含多位参会者）\n\n复制纪要素材前，可先检查或删除敏感内容。")
         layout.addWidget(self.preview, 1)
+        self.playback = Playback()
+        layout.addWidget(self.playback)
+        self.playback.positionChanged.connect(lambda seconds: self.preview.highlight_position(
+            seconds, self.playback.follow.isChecked()))
+        self.preview.seekRequested.connect(self.playback.seek)
+        self.preview.manuallyScrolled.connect(lambda: self.playback.follow.setChecked(False))
+        self.playback.follow.toggled.connect(lambda enabled: self.preview.highlight_position(
+            self.playback.player.position()/1000, enabled))
         self.partial_view = label("", "hint")
         self.partial_view.setMaximumHeight(100)
         self.partial_view.hide()
@@ -388,9 +426,18 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.show_error(f"无法枚举音频设备：{exc}")
 
+    def capture_mode_changed(self, *_args):
+        single = self.capture_mode.currentData() == 'microphone_only'
+        for widget in (self.system_label, self.system_combo, self.system_meter):
+            widget.setVisible(not single)
+        self.device_hint.setText('仅录实际拾音；请确保麦克风能听清自己和外放会议声音。' if single
+                                else '戴耳机可减少回声。会议声音会包含所选输出设备上的其他声音。')
+        self.set_controls()
+
     def save_settings(self):
-        settings = {"auto_transcribe": self.auto_transcribe.isChecked(), "vocabulary": self.vocabulary.text(),
-                    "live_enabled": self.live_enabled.isChecked()}
+        settings = {"auto_summary": self.auto_transcribe.isChecked(), "vocabulary": self.vocabulary.text(),
+                    "live_enabled": self.live_enabled.isChecked(), "live_engine": self.live_engine.currentData(), "summary_model": self.summary_model.currentData(),
+                    "capture_mode": self.capture_mode.currentData()}
         for combo, key in ((self.mic_combo, "microphone"), (self.system_combo, "system")):
             if combo.currentData():
                 settings[key] = combo.currentData().name
@@ -422,6 +469,7 @@ class MainWindow(QMainWindow):
     def start_recording(self):
         if self.recorder or self.task or self.process or self.live_process:
             return
+        self.playback.player.stop()
         self.save_settings()
         self.left_scroll.verticalScrollBar().setValue(0)
         self.active_session = new_session(self.title_edit.text())
@@ -430,20 +478,25 @@ class MainWindow(QMainWindow):
         self.live_partials = {}
         self.preview.clear()
         self.partial_view.hide()
-        self.recorder = Recorder(self.active_session, self.mic_combo.currentData(), self.system_combo.currentData())
+        system = self.system_combo.currentData() if self.capture_mode.currentData() == 'dual' else None
+        self.recorder = Recorder(self.active_session, self.mic_combo.currentData(), system)
         self.clock.setText("00:00:00")
         self.record_state.setText("正在打开设备…")
         self.run_task(self.recorder.start, self.recording_started)
 
     def recording_started(self, _):
         self.record_state.setText("● 正在录音")
-        self.device_hint.setText("请确认两路音量条都有变化。暂停时不保存声音，续录后时间连续。")
-        self.statusBar().showMessage("录音中：原声与麦克风分别保存。请勿拔出或切换正在录音的设备。")
+        single = self.capture_mode.currentData() == 'microphone_only'
+        self.device_hint.setText("请确认麦克风能收到自己和外放会议声音。" if single else "请确认两路音量条都有变化。暂停时不保存声音，续录后时间连续。")
+        self.statusBar().showMessage("录音中：仅保存麦克风混合声音。" if single else "录音中：原声与麦克风分别保存。请勿拔出或切换正在录音的设备。")
         if self.live_enabled.isChecked():
-            if model_ready("turbo"):
+            if ((self.live_engine.currentData() == 'nemotron' and diarization_runtime().is_file()
+                 and (nemotron_asr_path()/'model.safetensors').is_file()
+                 and (diarization_model()/'model.safetensors').is_file())
+                    or (self.live_engine.currentData() == 'turbo' and model_ready("turbo"))):
                 self.start_live()
             else:
-                self.live_status.setText("Turbo 尚未下载，本次只保存录音。可在会后选择 Turbo 并下载模型。")
+                self.live_status.setText("所选实时引擎尚未安装，本次只保存录音；请先配置对应模型。")
         else:
             self.live_status.setText("本次仅录音，可在会后转写。")
 
@@ -484,7 +537,9 @@ class MainWindow(QMainWindow):
             notes.append(" / ".join(silent) + "未检测到明显声音，请回听并检查设备选择。")
         if meta.get("mix_error"):
             notes.append("混合录音生成失败，但独立音轨已保留。")
-        self.device_hint.setText("；".join(notes) or "已保存两条独立音轨和混合录音，可以回听或转写。")
+        saved = ('已保存麦克风混合声音，可以回听或转写。' if meta.get('capture_mode') == 'microphone_only'
+                 else '已保存两条独立音轨和混合录音，可以回听或转写。')
+        self.device_hint.setText("；".join(notes) or saved)
         self.statusBar().showMessage(self.device_hint.text())
         self.pending_auto = (self.auto_transcribe.isChecked() and not meta.get("error")
                              and model_ready(self.model_combo.currentData()))
@@ -503,8 +558,12 @@ class MainWindow(QMainWindow):
         self.history.clear()
         for folder in sessions():
             meta = recover_session(folder) if recover else read_json(folder / "session.json")
-            status = {"saved": "已保存", "recovered": "已恢复", "interrupted": "需检查"}.get(meta.get("status"), "未完成")
-            item = QListWidgetItem(f'{meta.get("title", folder.name)}    ·    {meta.get("created_at", "")[:16].replace("T", "  ")}    ·    {timestamp(meta.get("duration", 0))}    ·    {status}')
+            summary = session_summary(folder)
+            headline = summary_headline(summary)
+            suffix = f"    ·    {headline}" if headline else ''
+            if meta.get('error'):
+                suffix += '    ·    需检查'
+            item = QListWidgetItem(f'{meta.get("title", folder.name)}    ·    {meta.get("created_at", "")[:16].replace("T", "  ")}    ·    {timestamp(meta.get("duration", 0))}{suffix}')
             item.setToolTip(item.text())
             item.setData(Qt.ItemDataRole.UserRole, folder)
             self.history.addItem(item)
@@ -523,18 +582,39 @@ class MainWindow(QMainWindow):
         self.show_selected_transcript()
 
     def show_selected_transcript(self, *_args, preserve=False):
+        self.playback.load(self.selected)
         if not preserve:
             self.preview.clear()
         self.partial_view.hide()
+        self.session_info.hide()
+        is_summary = self.version_combo.currentData() == 'summary'
+        self.copy_button.setText('复制摘要' if is_summary else '复制纪要素材')
+        self.export_button.setText('打开摘要文件夹' if is_summary else '打开 TXT / SRT')
+        if is_summary:
+            folder = self.summary_folder()
+            self.preview.clear()
+            if folder:
+                self.preview.setMarkdown((folder/'summary.md').read_text(encoding='utf-8') if (folder/'summary.md').exists()
+                                         else (folder/'summary.txt').read_text(encoding='utf-8-sig'))
+            else:
+                self.preview.setPlainText('尚未生成摘要，点击左侧“转写＋摘要”生成。')
+            self.set_controls()
+            return
         if self.selected:
             meta = read_json(self.selected / "session.json")
-            self.session_info.setText(meta.get("error") or "两条独立音轨保留；混合录音用于回听。")
+            self.session_info.setText(meta.get("error") or "")
+            self.session_info.setVisible(bool(meta.get("error")))
             path = self.transcript_folder()
             if path and (path / "transcript.txt").exists():
                 payload = read_json(path / "transcript.json")
                 if "segments" in payload:
                     metadata = payload.get("metadata", {})
-                    note = "Turbo 实时草稿" if metadata.get("mode") == "live" else "会后转写稿"
+                    note = (('Nemotron 3.5 实时草稿 · 说话者及时间戳待核对' if metadata.get('model') == 'nemotron-3.5-asr'
+                             else 'Turbo 实时草稿') if metadata.get('mode') == 'live' else '会后转写稿')
+                    if metadata.get("diarized"):
+                        note += " · Nemotron 说话者标签待核对"
+                    if metadata.get('live_replay'):
+                        note += ' · 原音轨回放重建'
                     if not metadata.get("complete", True):
                         note += " · 未完成，请会后重转核对"
                     if metadata.get("skipped_ranges"):
@@ -542,11 +622,13 @@ class MainWindow(QMainWindow):
                     self.preview.update_rows(payload["segments"], note=note, preserve=preserve)
                 else:
                     self.preview.setPlainText((path / "transcript.txt").read_text(encoding="utf-8-sig"))
+        self.preview.highlight_position(self.playback.player.position()/1000)
         self.set_controls()
 
     def transcript_folder(self):
         if self.selected:
-            filenames = (["latest_live_transcript.json"] if self.version_combo.currentData() == "live"
+            filenames = (["latest_speaker_transcript.json"] if self.version_combo.currentData() == "speakers"
+                         else ["latest_live_transcript.json"] if self.version_combo.currentData() == "live"
                          else ["latest_transcript.json", "latest_live_transcript.json"])
             value = next((read_json(self.selected / filename).get("path") for filename in filenames
                           if read_json(self.selected / filename).get("path")), None)
@@ -559,7 +641,10 @@ class MainWindow(QMainWindow):
             return
         model = self.model_combo.currentData()
         if not model_ready(model):
-            self.show_error("请先下载所选模型。下载只获取模型文件，不会上传录音。")
+            self.show_error("所选转写模型尚未安装，请先运行 Setup.cmd 完成本地模型安装。")
+            return
+        if not diarization_runtime().is_file() or not (diarization_model() / "model.safetensors").is_file():
+            self.show_error("Nemotron 独立环境或模型尚未安装，请先完成本地配置。")
             return
         self.save_settings()
         self.process_folder = self.selected
@@ -570,6 +655,95 @@ class MainWindow(QMainWindow):
                 "--language", self.language_combo.currentData(), "--device", self.device_combo.currentData(),
                 "--vocabulary", self.vocabulary.text()]
         self.start_process("transcribe", args)
+
+    def edit_speaker(self):
+        if self.process or self.recorder or self.task or self.live_process:
+            return
+        folder = self.transcript_folder()
+        if not folder:
+            return
+        payload = read_json(folder / 'transcript.json')
+        rows = payload.get('segments', [])
+        if not rows:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('逐句修改说话者 · 保存为新标注稿')
+        dialog.resize(780, 500)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel('选择原始句子，填写或选择标签。人工确认将保留；原文或时间戳改变后需重新核对。'))
+        listing = QListWidget()
+        for row in rows:
+            listing.addItem(f"{timestamp(row['start'])} · {row['source']}：{row['text']}")
+        layout.addWidget(listing, 1)
+        label = QComboBox()
+        label.setEditable(True)
+        label.addItems(list(dict.fromkeys(['本机麦克风'] + [r['source'] for r in rows]
+                                        + [f'参会者 {i}' for i in range(1, 9)])))
+        listing.currentRowChanged.connect(lambda i: label.setCurrentText(rows[i]['source']) if i >= 0 else None)
+        layout.addWidget(label)
+        def save():
+            if listing.currentRow() < 0 or not label.currentText().strip():
+                return
+            try:
+                save_manual(self.selected, folder, listing.currentRow(), label.currentText().strip())
+            except Exception as exc:
+                self.show_error(str(exc))
+                return
+            dialog.accept()
+            self.version_combo.setCurrentIndex(self.version_combo.findData('speakers'))
+            self.show_selected_transcript()
+        layout.addWidget(button('保存此句标签', save))
+        listing.setCurrentRow(0)
+        dialog.exec()
+
+    def start_diarization(self, transcript=None):
+        if self.process or self.recorder or self.task or self.live_process or not self.selected:
+            return
+        transcript = transcript or self.transcript_folder()
+        if not transcript:
+            return
+        if not diarization_runtime().is_file() or not (diarization_model() / "model.safetensors").is_file():
+            self.show_error("Nemotron 独立环境或模型尚未安装，请先完成本地配置。")
+            return
+        self.process_folder = self.selected
+        self.start_process("diarize", ["-m", "meeting_scribe.diarization", str(self.selected),
+                                      str(transcript), "--device", self.device_combo.currentData()])
+
+    def start_summary(self):
+        if self.process or self.recorder or self.task or self.live_process:
+            return
+        folder = self.transcript_folder()
+        if not folder:
+            return
+        self.save_settings()
+        self.process_folder = self.selected
+        self.summary_cancel = folder / "summary_cancel.flag"
+        self.summary_cancel.unlink(missing_ok=True)
+        self.start_process("summary", ["-m", "meeting_scribe.summary", str(folder),
+                           "--model", self.summary_model.currentData(), "--cancel", str(self.summary_cancel)])
+
+    def summary_folder(self):
+        return session_summary(self.selected)
+
+    def view_summary(self):
+        folder = self.summary_folder()
+        if not folder:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("会后摘要 · AI 初稿")
+        dialog.resize(800, 650)
+        layout = QVBoxLayout(dialog)
+        text = (folder / "summary.txt").read_text(encoding="utf-8-sig")
+        editor = QPlainTextEdit()
+        editor.setReadOnly(True)
+        editor.setPlainText(text)
+        layout.addWidget(editor)
+        actions = QHBoxLayout()
+        actions.addWidget(button("复制摘要", lambda: QApplication.clipboard().setText(text)))
+        actions.addWidget(button("打开文件夹 / 历史版本", lambda: self.open_path(folder.parent)))
+        actions.addWidget(button("关闭", dialog.accept))
+        layout.addLayout(actions)
+        dialog.exec()
 
     def download_model(self):
         if self.process or self.recorder or self.task or self.live_process:
@@ -600,11 +774,16 @@ class MainWindow(QMainWindow):
         self.process.readyReadStandardError.connect(self.read_errors)
         self.process.finished.connect(self.process_finished)
         self.process.errorOccurred.connect(self.process_error)
-        self.progress.setRange(0, 0 if kind == "download" else 100)
+        self.progress.setRange(0, 0 if kind in ("download", "summary") else 100)
         self.progress.setValue(0)
         self.job_status.setText("正在下载模型，可取消后续传…" if kind == "download" else "正在启动本地转写…")
+        if kind == "summary":
+            self.job_status.setText("正在连接本机 Ollama，生成会后摘要…")
+        if kind == "diarize":
+            self.job_status.setText("正在区分会议声音中的说话者；现有转写稿保留…")
         self.left_scroll.ensureWidgetVisible(self.job_status)
-        self.process.start(str(Path(sys.executable).with_name("python.exe")), args)
+        executable = diarization_runtime() if kind == "diarize" else Path(sys.executable).with_name("python.exe")
+        self.process.start(str(executable), args)
         self.set_controls()
 
     def read_process(self):
@@ -623,6 +802,7 @@ class MainWindow(QMainWindow):
             if kind == "status":
                 self.job_status.setText(event["message"])
             elif kind == "progress":
+                self.progress.setRange(0, 100)
                 self.progress.setValue(event["value"])
             elif kind == "segment":
                 self.batch_rows.append(event)
@@ -652,18 +832,33 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         if kind == "cancelled":
             self.progress.setValue(0)
-            self.job_status.setText("已取消。原始录音保留；未完成转写如有片段，将保存在 transcription_partial.json。")
+            self.job_status.setText("已取消，原始录音和已有完整稿件保留。")
         elif code == 0 and (kind == "download" or self.process_result):
             self.progress.setValue(100)
             self.job_status.setText("模型已准备好，可断网转写。" if kind == "download" else "转写完成 · TXT / Markdown / SRT 已保存。")
+            if kind == "summary":
+                self.job_status.setText("转写与摘要已完成，自动生成内容请核对。")
+                self.version_combo.setCurrentIndex(self.version_combo.findData('summary'))
+                self.refresh_history(select=self.process_folder)
+            if kind == "diarize":
+                self.job_status.setText("说话者标注稿已保存；编号可能变化，请核对。")
+                self.version_combo.setCurrentIndex(self.version_combo.findData("speakers"))
+                self.refresh_history(select=self.process_folder)
+                self.start_summary()
             if kind == "transcribe":
                 self.refresh_history(select=self.process_folder, preserve_preview=True)
                 if self.process_result.get("segments") == 0:
                     self.job_status.setText("转写完成，但未识别出语音。请回听录音并检查音源。")
+                else:
+                    self.start_diarization(Path(self.process_result['path']))
         else:
             self.progress.setValue(0)
             message = self.process_errors.strip()[-1600:] or f"进程异常退出（{code}）。"
             self.job_status.setText("转写 / 下载未完成，录音文件保留。GPU 出错时可选择 CPU 重试。")
+            if kind == "summary":
+                self.job_status.setText("摘要未完成；转写稿和已有摘要保留。")
+            if kind == "diarize":
+                self.job_status.setText("说话者区分未完成；原始录音和转写稿保留，可切换 CPU 重试。")
             self.show_error(message)
         self.set_controls()
 
@@ -677,6 +872,12 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(8000, lambda: process.kill() if self.live_process is process else None)
             return
         if self.process:
+            if self.process_kind == "summary":
+                self.summary_cancel.touch()
+                self.process_kind = "cancelled"
+                self.job_status.setText("正在取消摘要，等待本机模型结束当前请求…")
+                self.cancel_button.setEnabled(False)
+                return
             self.process_kind = "cancelled"
             self.job_status.setText("正在取消…")
             self.process.kill()
@@ -685,22 +886,28 @@ class MainWindow(QMainWindow):
         recording = self.recorder is not None
         busy = self.task is not None or self.process is not None
         idle = not recording and not busy and self.live_process is None
-        self.start_button.setEnabled(idle and self.mic_combo.count() > 0 and self.system_combo.count() > 0)
+        self.playback.setEnabled(idle and self.playback.path is not None)
+        if not idle:
+            self.playback.player.stop()
+        single = self.capture_mode.currentData() == 'microphone_only'
+        self.capture_hint.setText('麦克风采集自己和外放声音；所有人统一按参会者编号。' if single else '麦克风单独标为本机；电脑声音按参会者区分。')
+        self.start_button.setEnabled(idle and self.mic_combo.count() > 0 and (single or self.system_combo.count() > 0))
         self.pause_button.setEnabled(recording and not busy and not self.stopping)
         self.stop_button.setEnabled(recording and not busy and not self.stopping)
         for widget in (self.refresh_button, self.mic_combo, self.system_combo, self.title_edit,
                        self.model_combo, self.language_combo, self.device_combo, self.vocabulary,
-                       self.history, self.auto_transcribe, self.live_enabled, self.version_combo,
-                       self.choose_folder_button):
+                       self.history, self.auto_transcribe, self.live_enabled, self.live_engine, self.version_combo,
+                       self.choose_folder_button, self.summary_model, self.capture_mode):
             widget.setEnabled(idle)
+        self.system_combo.setEnabled(idle and not single)
+        self.system_meter.setEnabled(not single)
         self.transcribe_button.setEnabled(idle and self.selected is not None)
-        self.download_button.setEnabled(idle)
-        self.cancel_button.setEnabled(self.process is not None or self.live_process is not None)
+        self.edit_speaker_button.setEnabled(idle and self.version_combo.currentData() != 'summary' and self.transcript_folder() is not None)
+        self.cancel_button.setEnabled((self.process is not None and self.process_kind != "cancelled") or self.live_process is not None)
         self.cancel_button.setText("停止实时预览" if self.live_process else "取消")
-        for widget in (self.play_button, self.folder_button):
-            widget.setEnabled(idle and self.selected is not None)
+        self.folder_button.setEnabled(idle and self.selected is not None)
         for widget in (self.copy_button, self.export_button):
-            widget.setEnabled(idle and self.transcript_folder() is not None)
+            widget.setEnabled(idle and (self.summary_folder() is not None if self.version_combo.currentData() == 'summary' else self.transcript_folder() is not None))
 
     def tick(self):
         model = self.model_combo.currentData()
@@ -750,9 +957,10 @@ class MainWindow(QMainWindow):
         self.live_process.readyReadStandardError.connect(self.read_live_errors)
         self.live_process.finished.connect(self.live_finished)
         self.live_process.errorOccurred.connect(self.live_process_error)
-        self.live_status.setText("正在加载 Turbo；原始录音已开始保存…")
-        self.live_process.start(str(Path(sys.executable).with_name("python.exe")),
-                                ["-m", "meeting_scribe.live", str(self.live_folder),
+        nemotron = self.live_engine.currentData() == 'nemotron'
+        self.live_status.setText("正在加载实时模型；原始录音已开始保存…")
+        self.live_process.start(str(diarization_runtime() if nemotron else Path(sys.executable).with_name("python.exe")),
+                                ["-m", "meeting_scribe.live_nemotron" if nemotron else "meeting_scribe.live", str(self.live_folder),
                                  "--language", self.language_combo.currentData(), "--vocabulary", self.vocabulary.text()])
         self.set_controls()
 
@@ -774,6 +982,10 @@ class MainWindow(QMainWindow):
             elif kind == "live_commit":
                 self.live_rows.append(event)
                 changed = True
+            elif kind == 'live_snapshot':
+                self.live_rows = event['rows']
+                self.live_partials = {'all':event['partial']}
+                changed = True
             elif kind == "live_partial":
                 self.live_partials[event["source"]] = event["rows"]
                 changed = True
@@ -793,7 +1005,8 @@ class MainWindow(QMainWindow):
                 self.live_result = event
         if changed:
             provisional = [r for parts in self.live_partials.values() for r in parts]
-            self.preview.update_rows(self.live_rows, provisional, note="Turbo 实时草稿")
+            self.preview.update_rows(self.live_rows, provisional, note=(
+                'Nemotron 3.5 实时草稿 · 说话者及时间戳待核对' if self.live_engine.currentData() == 'nemotron' else 'Turbo 实时草稿'))
             self.partial_view.setText("临时段落会随上下文修订，停顿后归入已确认草稿。")
             self.partial_view.setVisible(bool(provisional))
 
@@ -833,7 +1046,7 @@ class MainWindow(QMainWindow):
             self.live_status.setToolTip(self.live_errors or f"进程退出代码：{code}")
             self.statusBar().showMessage(self.live_status.text() + " " + self.live_errors[-160:])
         else:
-            self.live_status.setText("Turbo 实时草稿已保存；可会后用 large-v3 重新转写。")
+            self.live_status.setText("实时草稿已保存；可会后用 large-v3 重新转写。")
         if not self.recorder:
             self.refresh_history(select=self.live_folder, preserve_preview=True)
         self.set_controls()
@@ -841,7 +1054,11 @@ class MainWindow(QMainWindow):
 
     def show_error(self, message):
         self.statusBar().showMessage(message[:200])
-        QMessageBox.warning(self, "需要检查", message)
+        dialog = QMessageBox(QMessageBox.Icon.Warning, "需要检查", message,
+                             QMessageBox.StandardButton.Ok, self)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        dialog.exec()
 
     def open_path(self, path):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
@@ -851,19 +1068,20 @@ class MainWindow(QMainWindow):
             self.open_path(self.selected)
 
     def play_recording(self):
-        if self.selected:
-            path = self.selected / "mixed.wav"
-            if not path.exists():
-                path = self.selected / "system.wav"
-            if path.exists():
-                self.open_path(path)
+        self.playback.load(self.selected)
+        self.playback.toggle_play()
 
     def open_transcript(self):
-        path = self.transcript_folder()
+        path = self.summary_folder() if self.version_combo.currentData() == 'summary' else self.transcript_folder()
         if path:
             self.open_path(path)
 
     def copy_summary(self):
+        if self.version_combo.currentData() == 'summary':
+            folder = self.summary_folder()
+            if folder:
+                QApplication.clipboard().setText((folder/'summary.txt').read_text(encoding='utf-8-sig'))
+            return
         path = self.transcript_folder()
         if path:
             QApplication.clipboard().setText((path / "summary_input.md").read_text(encoding="utf-8"))
@@ -875,4 +1093,5 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.save_settings()
+        self.playback.player.stop()
         event.accept()

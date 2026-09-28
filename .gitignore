@@ -8,6 +8,7 @@ artifacts/
 .pytest_cache/
 local_paths.json
 runtime-path.txt
+*.lnk
 .env
 .env.*
 *.wav
@@ -31,3 +32,9 @@ summary_input.md
 transcript.txt
 transcript.md
 transcript.json
+summaries/
+latest_summary.json
+summary_cancel.flag
+speaker_transcripts/
+latest_speaker_transcript.json
+speaker_turns.json

@@ -1,8 +1,8 @@
 """A reading-first transcript view with anchored scrolling."""
 from html import escape
 
-from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QTextBlockUserData, QTextCursor
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtGui import QTextBlockUserData, QTextCursor, QColor
 from PySide6.QtWidgets import QTextEdit
 
 from .storage import timestamp
@@ -27,15 +27,19 @@ def group_rows(rows, provisional=False):
             # English needs a space; Chinese does not need one between fragments.
             joiner = " " if previous["text"][-1:].isascii() or text[:1].isascii() else ""
             previous["text"] += joiner + text
+            previous['members'].append((joiner, row))
             previous["end"] = max(previous["end"], row.get("end", row["start"]))
         else:
             groups.append({"start": row["start"], "end": row.get("end", row["start"]),
                            "source": source, "text": row["text"].strip(),
+                           "members": [('', row)],
                            "key": ("partial" if provisional else "row", source, round(row["start"], 3))})
     return groups
 
 
 class TranscriptView(QTextEdit):
+    seekRequested = Signal(float)
+    manuallyScrolled = Signal()
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setReadOnly(True)
@@ -52,9 +56,49 @@ class TranscriptView(QTextEdit):
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
         """)
         self._render_signature = None
+        self._playback_ranges = []
+        self._seek_times = {}
+        self.verticalScrollBar().sliderPressed.connect(self.manuallyScrolled.emit)
+
+    def wheelEvent(self, event):
+        self.manuallyScrolled.emit()
+        super().wheelEvent(event)
+
+    def mousePressEvent(self, event):
+        self._press_position = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        point = event.position().toPoint()
+        href = self.anchorAt(point)
+        super().mouseReleaseEvent(event)
+        if (event.button() == Qt.MouseButton.LeftButton and
+                (point-getattr(self, '_press_position', point)).manhattanLength() < 4
+                and href in self._seek_times):
+            self.seekRequested.emit(self._seek_times[href])
+
+    def highlight_position(self, seconds, follow=False):
+        selections = []
+        for start, end, position, length in self._playback_ranges:
+            if start <= seconds < end:
+                selection = QTextEdit.ExtraSelection()
+                selection.cursor = QTextCursor(self.document())
+                selection.cursor.setPosition(position)
+                selection.cursor.setPosition(position+length, QTextCursor.MoveMode.KeepAnchor)
+                selection.format.setBackground(QColor('#ccece8'))
+                selections.append(selection)
+        self.setExtraSelections(selections)
+        if follow and selections:
+            rect = self.cursorRect(selections[0].cursor)
+            if rect.top() < 0 or rect.bottom() > self.viewport().height():
+                bar = self.verticalScrollBar()
+                bar.setValue(bar.value()+rect.top()-self.viewport().height()//3)
 
     def clear(self):
         self._render_signature = None
+        self._playback_ranges = []
+        self._seek_times = {}
+        self.setExtraSelections([])
         super().clear()
 
     def appendPlainText(self, text):
@@ -68,7 +112,8 @@ class TranscriptView(QTextEdit):
 
     def update_rows(self, rows, partial=(), note="", preserve=True):
         groups = group_rows(rows) + group_rows(partial, provisional=True)
-        signature = (tuple((g["key"], g["text"]) for g in groups), note)
+        signature = (tuple((g["key"], g["text"], tuple((r['start'], r.get('end'), r['text'])
+                           for _, r in g['members'])) for g in groups), note)
         if signature == self._render_signature:
             return
         bar = self.verticalScrollBar()
@@ -81,6 +126,7 @@ class TranscriptView(QTextEdit):
         selection = self.textCursor()
         old_position, old_anchor = selection.position(), selection.anchor()
         paragraphs, keys = [], []
+        links = {}
         if note:
             paragraphs.append('<p style="margin:0 0 16px 0;color:#738497;font-size:11px;">' + escape(note) + '</p>')
             keys.append(("note",))
@@ -89,13 +135,33 @@ class TranscriptView(QTextEdit):
             metadata = timestamp(group["start"]) + "  ·  " + group["source"]
             if temporary:
                 metadata += "  ·  临时文字"
+            sentence_html = []
+            for joiner, row in group['members']:
+                href = f'sentence:{len(links)}'
+                links[href] = (row['start'], row.get('end', row['start']))
+                sentence_html.append(escape(joiner) + '<a href="'+href+'" style="text-decoration:none;color:'
+                                     + ('#526d80' if temporary else '#213348')+';">'
+                                     + escape(row['text'].strip()).replace('\n', '<br/>')+'</a>')
             paragraphs.append('<p style="margin:0 0 16px 0;line-height:145%;">'
                               '<span style="color:#7c8c9b;font-size:10px;">' + escape(metadata) + '</span><br/>'
                               '<span style="font-size:14px;color:' + ('#526d80' if temporary else '#213348') + ';">'
-                              + escape(group["text"]).replace("\n", "<br/>") + '</span></p>')
+                              + ''.join(sentence_html) + '</span></p>')
             keys.append(group["key"])
         self.setHtml("".join(paragraphs))
+        self.setExtraSelections([])
         self._render_signature = signature
+        self._seek_times = {href: times[0] for href, times in links.items()}
+        self._playback_ranges = []
+        fragment_block = self.document().begin()
+        while fragment_block.isValid():
+            iterator = fragment_block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                href = fragment.charFormat().anchorHref()
+                if href in links:
+                    self._playback_ranges.append((*links[href], fragment.position(), fragment.length()))
+                iterator += 1
+            fragment_block = fragment_block.next()
         block = self.document().begin()
         anchored_top = None
         for key in keys:
