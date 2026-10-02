@@ -6,6 +6,8 @@ import re
 import uuid
 import time
 import tempfile
+import shutil
+import stat
 from datetime import datetime
 from pathlib import Path
 
@@ -99,3 +101,51 @@ def timestamp(seconds: float, milliseconds: bool = False) -> str:
     hour, minute = divmod(minute, 60)
     result = f"{hour:02}:{minute:02}:{second:02}"
     return result + f",{milli:03}" if milliseconds else result
+
+
+def _editable_session(folder: Path) -> Path:
+    folder = Path(folder).absolute()
+    config = read_json(data_root() / "recording_location.json")
+    roots = {recordings_root().resolve(), (data_root() / "recordings").resolve()}
+    roots.update(Path(p).resolve() for p in config.get("previous", []))
+    if (folder.is_symlink() or folder.is_junction()
+            or folder.resolve().parent not in roots
+            or not (folder / "session.json").is_file()):
+        raise ValueError("只能操作保存目录中的会议文件夹。")
+    return folder.resolve()
+
+
+def rename_session(folder: Path, title: str) -> None:
+    title = title.strip()
+    if not title:
+        raise ValueError("会议名称不能为空。")
+    folder = _editable_session(folder)
+    meta = read_json(folder / "session.json")
+    if not isinstance(meta, dict) or not meta:
+        raise ValueError("会议信息无法读取，未修改名称。")
+    meta["title"] = title
+    atomic_json(folder / "session.json", meta)
+
+
+def delete_session(folder: Path) -> None:
+    folder = _editable_session(folder)
+    # Refuse linked entries before deleting anything; never follow them outside the session.
+    for parent, dirs, files in os.walk(folder, followlinks=False):
+        for name in dirs + files:
+            entry = Path(parent) / name
+            if entry.is_symlink() or entry.is_junction():
+                raise ValueError("会议文件夹包含链接，请在文件管理器中检查后删除。")
+    def remove_readonly(function, path, error):
+        entry = Path(path)
+        # Windows/OneDrive directories may carry READONLY even when ACLs allow deletion.
+        # Only clear that attribute after a permission failure inside this validated tree.
+        if (os.name == 'nt' and isinstance(error, PermissionError)
+                and entry.resolve().is_relative_to(folder)
+                and not entry.is_symlink() and not entry.is_junction()
+                and entry.stat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY):
+            entry.chmod(stat.S_IWRITE)
+            function(path)
+            return
+        raise error
+
+    shutil.rmtree(folder, onexc=remove_readonly)

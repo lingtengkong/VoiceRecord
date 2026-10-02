@@ -21,6 +21,7 @@ verification/
 session.json
 settings.json
 recording_location.json
+processing_queue.json
 live_capture.json
 live_draft.json
 latest_transcript.json
@@ -33,6 +34,7 @@ transcript.txt
 transcript.md
 transcript.json
 summaries/
+summary_work/
 latest_summary.json
 summary_cancel.flag
 speaker_transcripts/

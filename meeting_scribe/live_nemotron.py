@@ -35,6 +35,24 @@ def timed_units(processor, tokens, times, until):
             for m in re.finditer(r'\s*(?:[\u3400-\u9fff]|[^\s\u3400-\u9fff]+)',text)]
 
 
+class BacklogGuard:
+    """Allow cold-start catch-up; stop only after sustained growing backlog."""
+    def __init__(self, now):
+        self.started = now
+        self.over_since = None
+        self.previous = None
+
+    def overloaded(self, lag, now):
+        shrinking = self.previous is not None and lag < self.previous - .05
+        self.previous = lag
+        if now-self.started < 90 or lag <= 30 or shrinking:
+            self.over_since = None
+            return False
+        if self.over_since is None:
+            self.over_since = now
+        return now-self.over_since >= 30
+
+
 class TextTrack:
     def __init__(self, model, processor, language, source, offset=0):
         self.stream = ASRStream(model, processor, language, offset)
@@ -180,7 +198,7 @@ class Engine:
             'peak_cuda_allocated_mib':torch.cuda.max_memory_allocated()/1024**2,
             'step_mean_seconds':sum(self.steps)/max(1,len(self.steps)),
             'step_max_seconds':max(self.steps,default=0), 'complete':complete})
-        emit('live_done',path=str(result),segments=len(rows),complete=complete)
+        emit('live_done',path=str(result),segments=len(rows),complete=complete,reason=reason)
 
 
 def main():
@@ -195,6 +213,7 @@ def main():
         engine.metadata['live_replay']=args.replay
         if args.vocabulary:
             emit('live_status',message='Nemotron 试用模式暂不使用术语提示；实时标签及时间戳需核对。')
+        guard = BacklogGuard(time.monotonic())
         while True:
             if (args.session/'live_cancel.flag').exists():
                 engine.finish(False,'用户停止实时预览；原始录音保留')
@@ -210,8 +229,8 @@ def main():
                 engine.finish(True)
                 return
             lag=capture['position']-min(t.seen for t in engine.tracks.values())
-            if lag>30 and capture['state']!='finished':
-                engine.finish(False,'实时识别积压超过30秒，已停止预览；原声保留，请会后转写')
+            if capture['state']!='finished' and guard.overloaded(lag,time.monotonic()):
+                engine.finish(False,'实时识别持续积压，已停止预览；原声保留，请会后转写')
                 return
             time.sleep(.02)
     except Exception as exc:

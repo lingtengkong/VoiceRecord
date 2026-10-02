@@ -5,6 +5,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.request import Request, build_opener, ProxyHandler
@@ -57,31 +58,39 @@ def check_cancel(flag):
 
 
 def generate(model, text, flag=None, compact=False):
-    check_cancel(flag)
-    prompt = ("提取本段会议事实，限350字，保留时间戳、决定、待办和未决事项：\n" if compact
-              else "整理以下会议材料，合并重复事实；每条保留时间戳，全文尽量在1200字以内。第一行必须是‘一句话总结：’，后接不超过24个中文字的具体主题概括（无需时间戳，不编造事实），然后空一行写完整纪要：\n")
-    payload = {"model": model, "think": False, "stream": True, "keep_alive": 0,
-               "options": {"num_ctx": 8192, "num_predict": 800 if compact else 2400,
-                           "temperature": 0.2},
-               "messages": [{"role": "system", "content": SYSTEM},
-                            {"role": "user", "content": prompt + text}]}
-    output, done = [], False
-    with request("/api/chat", payload) as response:
-        for line in response:
-            check_cancel(flag)
-            event = json.loads(line)
-            if event.get("error"):
-                raise RuntimeError(event["error"])
-            output.append(event.get("message", {}).get("content", ""))
-            if event.get("done"):
-                if event.get("done_reason") == "length":
-                    raise RuntimeError("摘要输出达到长度上限，未保存为完整纪要；请使用较短转写稿重试。")
-                done = True
-    check_cancel(flag)
-    answer = "".join(output).strip()
-    if not done or not answer:
-        raise RuntimeError("模型未返回完整摘要，请重试。")
-    return answer
+    # Compact extraction must not inherit the full five-section report template.
+    system = SYSTEM if not compact else SYSTEM.split('按以下标题整理：')[0] + '只输出最多6条去重事实，不写标题或引言；没有依据的项目不要展开。'
+    prompt = ("提取本段事实，控制在250字内，保留来源时间戳、决定、待办与未决事项：\n" if compact
+              else "合并重复事实，完整纪要控制在800字内，每类最多5条。第一行写‘一句话总结：’及24字内会议主题，随后写各类要点并保留来源时间戳：\n")
+    for attempt in range(2):
+        check_cancel(flag)
+        retry = ('上次输出过长，请重新精简，禁止重复内容；不要续写上次回答。\n' if attempt else '')
+        budget = ((1200, 2400) if compact else (2600, 4096))[attempt]
+        payload = {"model": model, "think": False, "stream": True, "keep_alive": "5m",
+                   "options": {"num_ctx": 8192, "num_predict": budget, "temperature": 0.2},
+                   "messages": [{"role": "system", "content": system},
+                                {"role": "user", "content": retry + prompt + text}]}
+        output, done, truncated = [], False, False
+        with request("/api/chat", payload) as response:
+            for line in response:
+                check_cancel(flag)
+                event = json.loads(line)
+                if event.get("error"):
+                    raise RuntimeError(event["error"])
+                output.append(event.get("message", {}).get("content", ""))
+                if event.get("done"):
+                    truncated = event.get("done_reason") == "length"
+                    done = True
+        check_cancel(flag)
+        answer = "".join(output).strip()
+        if truncated:
+            if attempt == 0:
+                emit('status', message='摘要输出较长，正在自动精简重试…')
+                continue
+            raise RuntimeError('摘要精简重试后仍达到输出上限；已保留完成的分段，默认重试会完整重算。')
+        if not done or not answer:
+            raise RuntimeError("模型未返回完整摘要，请重试。")
+        return answer
 
 
 def normalize_citations(text):
@@ -116,7 +125,8 @@ def generate_cited(model, text, flag=None, compact=False, warnings=None):
                   lambda m: m.group(0) if m.group(0) in allowed else "[时间待核对]", answer)
 
 
-def summarize(folder, model, flag=None):
+def summarize(folder, model, flag=None, *, reuse_cache=False):
+    started = time.monotonic()
     if model not in MODELS:
         raise ValueError("仅支持已指定的本地摘要模型。")
     payload = read_json(folder / "transcript.json")
@@ -129,11 +139,37 @@ def summarize(folder, model, flag=None):
         raise RuntimeError(f"请先在 Ollama 安装 {model}。摘要不会自动联网下载模型。")
     check_cancel(flag)
     warnings = []
+    def stage(text, compact=False):
+        if not compact:
+            return generate_cited(model, text, flag, warnings=warnings)
+        import hashlib
+        key = hashlib.sha256(json.dumps([model, compact, text, SYSTEM, 'bounded-summary-v2'],ensure_ascii=False).encode('utf-8')).hexdigest()
+        # Leave room for atomic_json's temporary suffix on Windows long meeting paths.
+        cache = folder / 'summary_work' / (key[:20]+'.json')
+        check_cancel(flag)
+        saved = read_json(cache) if reuse_cache else {}
+        if saved.get('key') == key and saved.get('complete') and saved.get('text'):
+            for warning in saved.get('warnings',[]):
+                if warning not in warnings: warnings.append(warning)
+            return saved['text']
+        stage_warnings = []
+        result = generate_cited(model, text, flag, compact=compact, warnings=stage_warnings)
+        check_cancel(flag)
+        try:
+            cache.parent.mkdir(exist_ok=True)
+            atomic_json(cache, {'key':key,'complete':True,'text':result,'warnings':stage_warnings})
+        except OSError:
+            emit('status', message='分段缓存暂时无法保存，继续生成摘要。')
+        for warning in stage_warnings:
+            if warning not in warnings: warnings.append(warning)
+        return result
+    emit('status', message='复用完整分段缓存，重新生成最终纪要。' if reuse_cache else
+         '完整重新生成摘要：所有分段及中间合并均重新计算，不复用缓存。')
     if len(parts) > 1:
         notes = []
         for i, part in enumerate(parts):
             emit("status", message=f"{model} · 正在提取第 {i+1}/{len(parts)} 段要点…")
-            notes.append(generate_cited(model, part, flag, compact=True, warnings=warnings))
+            notes.append(stage(part, compact=True))
             emit("progress", value=int(70*(i+1)/len(parts)))
         # Hierarchical reduction keeps long meetings within the context budget.
         for level in range(12):
@@ -144,7 +180,7 @@ def summarize(folder, model, flag=None):
             # Do not introduce artificial timestamps into the intermediate notes.
             batches = [b.replace("[00:00:00] 分段笔记：", "") for b in batches]
             emit("status", message=f"正在合并长会议要点（第 {level+1} 轮）…")
-            reduced = [generate_cited(model, b, flag, compact=True, warnings=warnings) for b in batches]
+            reduced = [stage(b, compact=True) for b in batches]
             if len("\n\n".join(reduced)) >= len(combined):
                 raise RuntimeError("分段摘要未能收敛，请缩短稿件后重试。")
             notes = reduced
@@ -154,13 +190,14 @@ def summarize(folder, model, flag=None):
     else:
         text = parts[0]
     emit("status", message=f"{model} · 正在生成完整纪要…")
-    answer = generate_cited(model, text, flag, warnings=warnings)
+    answer = stage(text)
     headline, answer = split_headline(answer)
     check_cancel(flag)
     dest = folder / "summaries" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     dest.mkdir(parents=True)
     metadata = {"model": model, "transcript": str(folder), "source_metadata": payload.get("metadata", {}),
                 "created_at": datetime.now().astimezone().isoformat(), "parts": len(parts),
+                "reuse_cache": reuse_cache, "elapsed_seconds": round(time.monotonic()-started, 2),
                 "citation_status": "needs_review" if warnings else "present_in_source",
                 "warnings": warnings, "headline": headline, "headline_kind": "meeting_topic"}
     note = "AI 本地生成初稿，请核对原文；摘要不能修复识别错误。"
@@ -261,13 +298,23 @@ def main():
     parser.add_argument("folder", type=Path)
     parser.add_argument("--model", choices=MODELS, required=True)
     parser.add_argument("--cancel", type=Path)
+    parser.add_argument("--reuse-cache", action="store_true", help="Explicitly reuse completed intermediate summaries")
     args = parser.parse_args()
     try:
-        result = summarize(args.folder, args.model, args.cancel)
-        emit("done", path=str(result))
+        result = summarize(args.folder, args.model, args.cancel, reuse_cache=args.reuse_cache)
+        elapsed = read_json(result / 'summary.json')['elapsed_seconds']
+        emit('status', message=f'摘要生成完成，用时 {elapsed:.1f} 秒。')
+        emit("done", path=str(result), elapsed_seconds=elapsed)
     except Exception as exc:
         emit("error", message=error_message(exc))
         sys.exit(1)
+    finally:
+        # Retain one model across chunks, then release VRAM for the next ASR job.
+        try:
+            with request('/api/generate', {'model': args.model, 'keep_alive': 0}, timeout=10):
+                pass
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

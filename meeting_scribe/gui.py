@@ -8,18 +8,19 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QProcess, QProcessEnvironment, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QIcon
+from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QIcon, QPixmap, QPainter, QPen, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QComboBox, QProgressBar, QFrame, QListWidget, QListWidgetItem,
     QPlainTextEdit, QMessageBox, QCheckBox, QSplitter, QSizePolicy, QScrollArea, QLayout, QFileDialog, QDialog,
+    QMenu, QInputDialog,
 )
 
 from .audio import Recorder, list_devices, recover_session
 from .branding import ICON_PATH, WINDOW_TITLE
 from .summary import session_summary, summary_headline
 from .storage import data_root, new_session, read_json, atomic_json, sessions, timestamp
-from .storage import recordings_root, set_recordings_root
+from .storage import recordings_root, set_recordings_root, rename_session, delete_session
 from .transcription import MODELS, model_ready, export_transcript
 from .transcript_view import TranscriptView
 from .playback import Playback
@@ -33,6 +34,9 @@ STYLE = """
 QWidget { font-family: 'Microsoft YaHei UI', 'Segoe UI'; font-size: 13px; color: #213348; }
 QMainWindow, #root { background: #f1f5f8; }
 QDialog, QMessageBox { background-color: #f1f5f8; color: #213348; }
+QMenu { background-color: #ffffff; color: #213348; border: 1px solid #d5e1eb; padding: 4px; }
+QMenu::item { padding: 7px 22px; }
+QMenu::item:selected { background-color: #e0f2ef; color: #006e69; }
 QDialog QLabel, QMessageBox QLabel { background-color: transparent; color: #213348; }
 #settings, QScrollArea { background: #f1f5f8; border: none; }
 #settings QWidget { font-size: 12px; }
@@ -150,7 +154,21 @@ class MainWindow(QMainWindow):
         self.live_last_event = 0.
         self.live_cancelled = False
         self.pending_auto = False
+        self.job_queue = []
+        self.job_options = {}
+        self.job_states = {}
+        self.queue_path = data_root() / "processing_queue.json"
+        if recover_sessions:
+            for job in read_json(self.queue_path, default=[]):
+                folder = Path(job["folder"])
+                if folder.is_dir():
+                    if job.get("running"):
+                        self.job_states[folder] = "处理被中断，请重新转写"
+                    else:
+                        self.job_queue.append((folder, job["options"]))
+                        self.job_states[folder] = "等待处理"
         self.summary_cancel = None
+        self.summarize_after_transcription = False
         self.settings_path = data_root() / "settings.json"
         self.settings = read_json(self.settings_path)
         self.setStyleSheet(STYLE)
@@ -161,6 +179,8 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(150)
+        if recover_sessions:
+            QTimer.singleShot(0, self.drain_jobs)
         self.statusBar().showMessage("就绪。录音和转写均在本机进行；未启动任何录音。")
 
     def _build(self):
@@ -285,9 +305,11 @@ class MainWindow(QMainWindow):
         self.summary_model.setCurrentIndex(max(0,self.summary_model.findData(self.settings.get("summary_model","qwen3.5:4b"))))
         layout.addWidget(self.summary_model)
         actions = QHBoxLayout()
-        self.transcribe_button = button("转写＋摘要", self.start_transcription, "primary")
+        self.transcribe_button = button("转写", self.start_transcription, "primary")
+        self.summarize_button = button("摘要", self.start_summary)
         self.cancel_button = button("取消", self.cancel_process)
-        actions.addWidget(self.transcribe_button, 2)
+        actions.addWidget(self.transcribe_button, 1)
+        actions.addWidget(self.summarize_button, 1)
         actions.addWidget(self.cancel_button, 1)
         layout.addLayout(actions)
         self.progress = QProgressBar()
@@ -337,6 +359,8 @@ class MainWindow(QMainWindow):
         self.history.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.history.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self.history.currentItemChanged.connect(self.select_session)
+        self.history.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.history.customContextMenuRequested.connect(self.history_menu)
         layout.addWidget(self.history, 1)
         self.session_info = label("", "muted")
         self.session_info.hide()
@@ -467,8 +491,11 @@ class MainWindow(QMainWindow):
         self.maybe_auto_transcribe()
 
     def start_recording(self):
-        if self.recorder or self.task or self.process or self.live_process:
+        if self.recorder or self.task:
             return
+        if self.live_process:
+            self.cancel_process()
+        self.maybe_auto_transcribe()
         self.playback.player.stop()
         self.save_settings()
         self.left_scroll.verticalScrollBar().setValue(0)
@@ -480,6 +507,7 @@ class MainWindow(QMainWindow):
         self.partial_view.hide()
         system = self.system_combo.currentData() if self.capture_mode.currentData() == 'dual' else None
         self.recorder = Recorder(self.active_session, self.mic_combo.currentData(), system)
+        self.refresh_history(select=self.active_session, preserve_preview=True)
         self.clock.setText("00:00:00")
         self.record_state.setText("正在打开设备…")
         self.run_task(self.recorder.start, self.recording_started)
@@ -489,7 +517,9 @@ class MainWindow(QMainWindow):
         single = self.capture_mode.currentData() == 'microphone_only'
         self.device_hint.setText("请确认麦克风能收到自己和外放会议声音。" if single else "请确认两路音量条都有变化。暂停时不保存声音，续录后时间连续。")
         self.statusBar().showMessage("录音中：仅保存麦克风混合声音。" if single else "录音中：原声与麦克风分别保存。请勿拔出或切换正在录音的设备。")
-        if self.live_enabled.isChecked():
+        if self.process or self.job_queue or self.live_process:
+            self.live_status.setText("后台正在处理上一会议，本次仅录音；结束后排队转写。")
+        elif self.live_enabled.isChecked():
             if ((self.live_engine.currentData() == 'nemotron' and diarization_runtime().is_file()
                  and (nemotron_asr_path()/'model.safetensors').is_file()
                  and (diarization_model()/'model.safetensors').is_file())
@@ -525,7 +555,7 @@ class MainWindow(QMainWindow):
         self.pause_button.setText("暂停")
         self.record_state.setText("已保存" if not meta.get("error") else "已保存 · 请检查")
         if self.live_process:
-            self.live_status.setText("录音已保存，Turbo 正在处理末尾文字…")
+            self.live_status.setText("录音已保存，实时引擎正在处理末尾文字…")
         else:
             self.refresh_history(select=self.active_session, preserve_preview=True)
         stats = meta.get("audio_stats", {})
@@ -545,12 +575,68 @@ class MainWindow(QMainWindow):
                              and model_ready(self.model_combo.currentData()))
         QTimer.singleShot(200, self.maybe_auto_transcribe)
 
+    def save_job_queue(self):
+        jobs = [dict(folder=str(folder), options=options) for folder, options in self.job_queue]
+        if self.process and self.process_folder:
+            jobs.insert(0, dict(folder=str(self.process_folder), options=self.job_options, running=True))
+        try:
+            atomic_json(self.queue_path, jobs)
+        except OSError as exc:
+            self.statusBar().showMessage(f"任务队列暂未保存，关闭前请等待处理完成：{exc}")
+
+    def processing_options(self):
+        return dict(model=self.model_combo.currentData(), language=self.language_combo.currentData(),
+                    device=self.device_combo.currentData(), vocabulary=self.vocabulary.text(),
+                    summary_model=self.summary_model.currentData())
+
     def maybe_auto_transcribe(self):
-        if self.pending_auto and not any((self.live_process, self.recorder, self.task, self.process)):
+        if self.pending_auto and not self.task:
             self.pending_auto = False
-            self.refresh_history(select=self.active_session)
-            self.version_combo.setCurrentIndex(0)
-            self.start_transcription()
+            if self.auto_transcribe.isChecked():
+                folder = self.active_session
+                self.job_queue.append((folder, self.processing_options()))
+                self.job_states[folder] = '等待处理'
+                self.save_job_queue()
+                self.refresh_history(preserve_preview=True)
+        self.drain_jobs()
+
+    def drain_jobs(self):
+        if self.process or self.live_process or self.task or not self.job_queue:
+            return
+        folder, options = self.job_queue.pop(0)
+        if folder == self.active_session and not self.auto_transcribe.isChecked():
+            self.job_states[folder] = "已取消自动处理，录音保留"
+            self.save_job_queue()
+            QTimer.singleShot(0, self.drain_jobs)
+            return
+        self.start_transcription(summarize_after=True, folder=folder, options=options)
+        if not self.process:
+            self.job_states[folder] = "未能启动，请检查模型配置"
+            QTimer.singleShot(0, self.drain_jobs)
+        self.save_job_queue()
+
+    def update_job_indicators(self):
+        pixmap = QPixmap(18, 18)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor('#00877f'), 2))
+        painter.drawArc(3, 3, 12, 12, -int(time.monotonic()*240) % 360 * 16, 260 * 16)
+        painter.end()
+        spinner = QIcon(pixmap)
+        for index in range(self.history.count()):
+            item = self.history.item(index)
+            folder = item.data(Qt.ItemDataRole.UserRole)
+            base = item.data(Qt.ItemDataRole.UserRole + 1) or item.text()
+            state = self.job_states.get(folder)
+            item.setIcon(QIcon())
+            if self.process and folder == self.process_folder:
+                state = {'transcribe':'转写中', 'diarize':'区分说话者', 'summary':'提取摘要',
+                         'cancelled':'正在取消'}.get(self.process_kind, '处理中')
+                item.setIcon(spinner)
+            if self.recorder and folder == self.active_session:
+                state = '● 录音中'
+            item.setText((state + '    ·    ' if state else '') + base)
 
     def refresh_history(self, recover=False, select=None, preserve_preview=False):
         wanted = select or self.selected
@@ -564,6 +650,7 @@ class MainWindow(QMainWindow):
             if meta.get('error'):
                 suffix += '    ·    需检查'
             item = QListWidgetItem(f'{meta.get("title", folder.name)}    ·    {meta.get("created_at", "")[:16].replace("T", "  ")}    ·    {timestamp(meta.get("duration", 0))}{suffix}')
+            item.setData(Qt.ItemDataRole.UserRole + 1, item.text())
             item.setToolTip(item.text())
             item.setData(Qt.ItemDataRole.UserRole, folder)
             self.history.addItem(item)
@@ -574,8 +661,70 @@ class MainWindow(QMainWindow):
         self.history.blockSignals(False)
         item = self.history.currentItem()
         self.selected = item.data(Qt.ItemDataRole.UserRole) if item else None
-        self.show_selected_transcript(preserve=preserve_preview)
+        if not self.recorder:
+            self.show_selected_transcript(preserve=preserve_preview)
+        self.update_job_indicators()
         self.set_controls()
+
+    def history_menu(self, position):
+        if any(x is not None for x in (self.recorder, self.task, self.process, self.live_process)):
+            return
+        item = self.history.itemAt(position)
+        if item is None:
+            return
+        self.history.setCurrentItem(item)
+        folder = item.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        rename = menu.addAction("修改名称")
+        delete = menu.addAction("删除…")
+        action = menu.exec(self.history.viewport().mapToGlobal(position))
+        if action == rename:
+            self.rename_meeting(folder)
+        elif action == delete:
+            self.delete_meeting(folder)
+
+    def rename_meeting(self, folder):
+        if any(f == folder for f, _ in self.job_queue):
+            self.show_error("该会议正在排队，请等处理完成后修改。")
+            return
+        title = read_json(folder / "session.json").get("title", folder.name)
+        text, accepted = QInputDialog.getText(self, "修改会议名称", "会议名称：", text=title)
+        if not accepted:
+            return
+        try:
+            rename_session(folder, text)
+        except (OSError, ValueError) as exc:
+            self.show_error(str(exc))
+            return
+        self.refresh_history(select=folder, preserve_preview=True)
+
+    def delete_meeting(self, folder):
+        if any(f == folder for f, _ in self.job_queue):
+            self.show_error("该会议正在排队，请等处理完成后删除。")
+            return
+        title = read_json(folder / "session.json").get("title", folder.name)
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("删除会议记录")
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText(f'确定删除“{title}”？\n\n将永久删除这条会议的录音、转写和摘要文件，无法撤销。\n\n文件夹：{folder}')
+        confirm = dialog.addButton("删除", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(cancel)
+        dialog.setEscapeButton(cancel)
+        dialog.exec()
+        if dialog.clickedButton() != confirm:
+            return
+        self.playback.load(None)
+        try:
+            delete_session(folder)
+        except (OSError, ValueError) as exc:
+            self.refresh_history()
+            self.show_error(f"删除未完成：{exc}")
+            return
+        if self.selected == folder:
+            self.selected = None
+        self.refresh_history()
 
     def select_session(self, item, _previous=None):
         self.selected = item.data(Qt.ItemDataRole.UserRole) if item else None
@@ -597,7 +746,7 @@ class MainWindow(QMainWindow):
                 self.preview.setMarkdown((folder/'summary.md').read_text(encoding='utf-8') if (folder/'summary.md').exists()
                                          else (folder/'summary.txt').read_text(encoding='utf-8-sig'))
             else:
-                self.preview.setPlainText('尚未生成摘要，点击左侧“转写＋摘要”生成。')
+                self.preview.setPlainText('尚未生成摘要。有转写文字后，点击左侧“摘要”生成。')
             self.set_controls()
             return
         if self.selected:
@@ -636,10 +785,12 @@ class MainWindow(QMainWindow):
                 return Path(value)
         return None
 
-    def start_transcription(self):
-        if self.process or self.recorder or self.task or self.live_process or not self.selected:
+    def start_transcription(self, *_args, summarize_after=False, folder=None, options=None):
+        target = folder or self.selected
+        if self.process or self.live_process or not target or (folder is None and (self.recorder or self.task)):
             return
-        model = self.model_combo.currentData()
+        self.job_options = options or self.processing_options()
+        model = self.job_options["model"]
         if not model_ready(model):
             self.show_error("所选转写模型尚未安装，请先运行 Setup.cmd 完成本地模型安装。")
             return
@@ -647,13 +798,15 @@ class MainWindow(QMainWindow):
             self.show_error("Nemotron 独立环境或模型尚未安装，请先完成本地配置。")
             return
         self.save_settings()
-        self.process_folder = self.selected
+        self.summarize_after_transcription = summarize_after
+        self.process_folder = target
         self.batch_rows = []
-        self.version_combo.setCurrentIndex(0)
-        self.preview.clear()
-        args = ["-m", "meeting_scribe.transcription", str(self.selected), "--model", model,
-                "--language", self.language_combo.currentData(), "--device", self.device_combo.currentData(),
-                "--vocabulary", self.vocabulary.text()]
+        if not self.recorder and self.selected == target:
+            self.version_combo.setCurrentIndex(0)
+            self.preview.clear()
+        args = ["-m", "meeting_scribe.transcription", str(target), "--model", model,
+                "--language", self.job_options["language"], "--device", self.job_options["device"],
+                "--vocabulary", self.job_options["vocabulary"]]
         self.start_process("transcribe", args)
 
     def edit_speaker(self):
@@ -696,8 +849,9 @@ class MainWindow(QMainWindow):
         listing.setCurrentRow(0)
         dialog.exec()
 
-    def start_diarization(self, transcript=None):
-        if self.process or self.recorder or self.task or self.live_process or not self.selected:
+    def start_diarization(self, transcript=None, *, folder=None):
+        target = folder or self.selected
+        if self.process or self.live_process or not target or (folder is None and (self.recorder or self.task)):
             return
         transcript = transcript or self.transcript_folder()
         if not transcript:
@@ -705,22 +859,38 @@ class MainWindow(QMainWindow):
         if not diarization_runtime().is_file() or not (diarization_model() / "model.safetensors").is_file():
             self.show_error("Nemotron 独立环境或模型尚未安装，请先完成本地配置。")
             return
-        self.process_folder = self.selected
-        self.start_process("diarize", ["-m", "meeting_scribe.diarization", str(self.selected),
-                                      str(transcript), "--device", self.device_combo.currentData()])
+        self.process_folder = target
+        self.start_process("diarize", ["-m", "meeting_scribe.diarization", str(target),
+                                      str(transcript), "--device", self.job_options.get("device", self.device_combo.currentData())])
 
-    def start_summary(self):
-        if self.process or self.recorder or self.task or self.live_process:
+    def summary_source(self):
+        if not self.selected:
+            return None
+        preferred = self.transcript_folder() if self.version_combo.currentData() != 'summary' else None
+        candidates = [preferred]
+        for name in ('latest_speaker_transcript.json','latest_transcript.json','latest_live_transcript.json'):
+            path = read_json(self.selected/name).get('path')
+            if path:
+                candidates.append(Path(path))
+        for folder in candidates:
+            if folder and any(str(r.get('text','')).strip() for r in read_json(folder/'transcript.json').get('segments', [])):
+                return folder
+        return None
+
+    def start_summary(self, *, session=None, transcript=None):
+        if self.process or self.live_process or (session is None and (self.recorder or self.task)):
             return
-        folder = self.transcript_folder()
+        folder = transcript or self.summary_source()
         if not folder:
             return
         self.save_settings()
-        self.process_folder = self.selected
+        self.process_folder = session or self.selected
+        if session is None:
+            self.job_options = self.processing_options()
         self.summary_cancel = folder / "summary_cancel.flag"
         self.summary_cancel.unlink(missing_ok=True)
         self.start_process("summary", ["-m", "meeting_scribe.summary", str(folder),
-                           "--model", self.summary_model.currentData(), "--cancel", str(self.summary_cancel)])
+                           "--model", self.job_options.get("summary_model", self.summary_model.currentData()), "--cancel", str(self.summary_cancel)])
 
     def summary_folder(self):
         return session_summary(self.selected)
@@ -781,9 +951,11 @@ class MainWindow(QMainWindow):
             self.job_status.setText("正在连接本机 Ollama，生成会后摘要…")
         if kind == "diarize":
             self.job_status.setText("正在区分会议声音中的说话者；现有转写稿保留…")
-        self.left_scroll.ensureWidgetVisible(self.job_status)
+        if not self.recorder:
+            self.left_scroll.ensureWidgetVisible(self.job_status)
         executable = diarization_runtime() if kind == "diarize" else Path(sys.executable).with_name("python.exe")
         self.process.start(str(executable), args)
+        self.save_job_queue()
         self.set_controls()
 
     def read_process(self):
@@ -806,7 +978,8 @@ class MainWindow(QMainWindow):
                 self.progress.setValue(event["value"])
             elif kind == "segment":
                 self.batch_rows.append(event)
-                self.preview.update_rows(self.batch_rows, note="正在生成会后转写稿")
+                if not self.recorder and self.selected == self.process_folder and self.version_combo.currentData() == "final":
+                    self.preview.update_rows(self.batch_rows, note="正在生成会后转写稿")
             elif kind == "error":
                 self.process_errors += event["message"] + "\n"
             elif kind == "done":
@@ -831,27 +1004,36 @@ class MainWindow(QMainWindow):
         self.process = None
         self.progress.setRange(0, 100)
         if kind == "cancelled":
+            self.summarize_after_transcription = False
             self.progress.setValue(0)
             self.job_status.setText("已取消，原始录音和已有完整稿件保留。")
         elif code == 0 and (kind == "download" or self.process_result):
             self.progress.setValue(100)
             self.job_status.setText("模型已准备好，可断网转写。" if kind == "download" else "转写完成 · TXT / Markdown / SRT 已保存。")
+            visible = not self.recorder and self.selected == self.process_folder
             if kind == "summary":
-                self.job_status.setText("转写与摘要已完成，自动生成内容请核对。")
-                self.version_combo.setCurrentIndex(self.version_combo.findData('summary'))
-                self.refresh_history(select=self.process_folder)
+                elapsed = self.process_result.get('elapsed_seconds')
+                timing = f" · 用时 {elapsed:.1f} 秒" if isinstance(elapsed, (int, float)) else ''
+                self.job_status.setText("摘要已完成" + timing + "，自动生成内容请核对。")
+                if visible:
+                    self.version_combo.setCurrentIndex(self.version_combo.findData('summary'))
             if kind == "diarize":
                 self.job_status.setText("说话者标注稿已保存；编号可能变化，请核对。")
-                self.version_combo.setCurrentIndex(self.version_combo.findData("speakers"))
-                self.refresh_history(select=self.process_folder)
-                self.start_summary()
+                if visible:
+                    self.version_combo.setCurrentIndex(self.version_combo.findData("speakers"))
+                continue_summary = self.summarize_after_transcription
+                self.summarize_after_transcription = False
+                if continue_summary:
+                    self.start_summary(session=self.process_folder, transcript=Path(self.process_result['path']))
             if kind == "transcribe":
-                self.refresh_history(select=self.process_folder, preserve_preview=True)
                 if self.process_result.get("segments") == 0:
+                    self.summarize_after_transcription = False
                     self.job_status.setText("转写完成，但未识别出语音。请回听录音并检查音源。")
                 else:
-                    self.start_diarization(Path(self.process_result['path']))
+                    self.start_diarization(Path(self.process_result['path']), folder=self.process_folder)
+            self.refresh_history(preserve_preview=not visible)
         else:
+            self.summarize_after_transcription = False
             self.progress.setValue(0)
             message = self.process_errors.strip()[-1600:] or f"进程异常退出（{code}）。"
             self.job_status.setText("转写 / 下载未完成，录音文件保留。GPU 出错时可选择 CPU 重试。")
@@ -860,6 +1042,11 @@ class MainWindow(QMainWindow):
             if kind == "diarize":
                 self.job_status.setText("说话者区分未完成；原始录音和转写稿保留，可切换 CPU 重试。")
             self.show_error(message)
+        if not self.process:
+            self.job_states[self.process_folder] = ('已取消' if kind == 'cancelled' else
+                '处理完成' if code == 0 and self.process_result else '处理失败，可重试')
+            self.save_job_queue()
+            QTimer.singleShot(0, self.drain_jobs)
         self.set_controls()
 
     def cancel_process(self):
@@ -885,23 +1072,32 @@ class MainWindow(QMainWindow):
     def set_controls(self):
         recording = self.recorder is not None
         busy = self.task is not None or self.process is not None
-        idle = not recording and not busy and self.live_process is None
+        capture_idle = not recording and self.task is None
+        idle = capture_idle and not busy and self.live_process is None
         self.playback.setEnabled(idle and self.playback.path is not None)
         if not idle:
             self.playback.player.stop()
         single = self.capture_mode.currentData() == 'microphone_only'
         self.capture_hint.setText('麦克风采集自己和外放声音；所有人统一按参会者编号。' if single else '麦克风单独标为本机；电脑声音按参会者区分。')
-        self.start_button.setEnabled(idle and self.mic_combo.count() > 0 and (single or self.system_combo.count() > 0))
-        self.pause_button.setEnabled(recording and not busy and not self.stopping)
-        self.stop_button.setEnabled(recording and not busy and not self.stopping)
+        self.start_button.setEnabled(capture_idle and self.mic_combo.count() > 0 and (single or self.system_combo.count() > 0))
+        self.pause_button.setEnabled(recording and self.task is None and not self.stopping)
+        self.stop_button.setEnabled(recording and self.task is None and not self.stopping)
         for widget in (self.refresh_button, self.mic_combo, self.system_combo, self.title_edit,
                        self.model_combo, self.language_combo, self.device_combo, self.vocabulary,
-                       self.history, self.auto_transcribe, self.live_enabled, self.live_engine, self.version_combo,
+                       self.history, self.live_enabled, self.live_engine, self.version_combo,
                        self.choose_folder_button, self.summary_model, self.capture_mode):
             widget.setEnabled(idle)
-        self.system_combo.setEnabled(idle and not single)
+        # This is a post-recording preference, not a capture/model setting.
+        # Keep it editable while recording, paused, saving or draining live ASR.
+        self.auto_transcribe.setEnabled(True)
+        for widget in (self.refresh_button, self.mic_combo, self.title_edit, self.capture_mode, self.live_enabled):
+            widget.setEnabled(capture_idle)
+        self.history.setEnabled(not recording and self.task is None)
+        self.version_combo.setEnabled(not recording and self.task is None)
+        self.system_combo.setEnabled(capture_idle and not single)
         self.system_meter.setEnabled(not single)
         self.transcribe_button.setEnabled(idle and self.selected is not None)
+        self.summarize_button.setEnabled(idle and self.summary_source() is not None)
         self.edit_speaker_button.setEnabled(idle and self.version_combo.currentData() != 'summary' and self.transcript_folder() is not None)
         self.cancel_button.setEnabled((self.process is not None and self.process_kind != "cancelled") or self.live_process is not None)
         self.cancel_button.setText("停止实时预览" if self.live_process else "取消")
@@ -910,6 +1106,7 @@ class MainWindow(QMainWindow):
             widget.setEnabled(idle and (self.summary_folder() is not None if self.version_combo.currentData() == 'summary' else self.transcript_folder() is not None))
 
     def tick(self):
+        self.update_job_indicators()
         model = self.model_combo.currentData()
         self.model_status.setText(f'{model}  ·  ' + ("本地模型已就绪" if model_ready(model) else "尚未下载，首次下载需要联网"))
         if self.recorder and self.recorder.active and not self.stopping:
@@ -1003,7 +1200,7 @@ class MainWindow(QMainWindow):
                 self.live_errors += event["message"]
             elif kind == "live_done":
                 self.live_result = event
-        if changed:
+        if changed and (not self.recorder or self.active_session == self.live_folder):
             provisional = [r for parts in self.live_partials.values() for r in parts]
             self.preview.update_rows(self.live_rows, provisional, note=(
                 'Nemotron 3.5 实时草稿 · 说话者及时间戳待核对' if self.live_engine.currentData() == 'nemotron' else 'Turbo 实时草稿'))
@@ -1045,6 +1242,8 @@ class MainWindow(QMainWindow):
             self.live_status.setText("实时识别已退出，原声继续保存。可会后转写。")
             self.live_status.setToolTip(self.live_errors or f"进程退出代码：{code}")
             self.statusBar().showMessage(self.live_status.text() + " " + self.live_errors[-160:])
+        elif not self.live_result.get("complete", False) or not self.live_result.get("segments", 0):
+            self.live_status.setText("实时转写未完成：" + (self.live_result.get("reason") or "未识别到文字，请会后重新转写。"))
         else:
             self.live_status.setText("实时草稿已保存；可会后用 large-v3 重新转写。")
         if not self.recorder:

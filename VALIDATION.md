@@ -1,5 +1,11 @@
 # 验证记录
 
+## 2026-09-28 长会议摘要输出上限修正
+
+54 项测试通过。分段提取不再使用完整纪要模板，输出长度触顶时以更充裕 token 预算精简重试一次；截断输出仍不作为完整摘要保存。完整分段采用内容和模型关联的本地缓存，验证最终生成失败后重试不重复处理已完成分段；缓存文件名为 Windows 原子写入临时后缀留出空间，缓存写入失败不阻断生成。
+
+用户报告的约 25 分钟录音对应转写稿，在本机 Qwen3.5:4B 上按 8 段重新生成并保存摘要；最终引用检查仍有未匹配项，结果明确标为“引用待核对”。这是实际长稿运行完成的验证，不代表摘要事实及归属已经人工审核；未上传用户内容。
+
 ## 2026-09-28 转写与摘要一体化
 
 48 项单元测试通过，覆盖三阶段串联、失败不继续、摘要标题提取与长度限制、会议级摘要索引及原文保留。`scripts/verify_summary_pipeline.py` 用 18 秒合成录音，通过真实 Qt QProcess、Turbo GPU、Nemotron 分离和本机 Ollama Qwen3.5:4B 完成全链路；确认默认自动执行、右侧摘要展示、列表短总结、摘要复制，以及切回正文后的播放高亮恢复。截图 `artifacts/summary_pipeline_ui.png` 已检查。未使用真实会议验证摘要事实准确率。
@@ -116,3 +122,11 @@ Windows GPU/CPU 离线推理均跑通，资源占用较低，但合成样本上�
 - `scripts/verify_diarization_ui.py` 使用已知的 62 秒三人合成音频，转为 48 kHz 后从真实 Qt 按钮启动隔离环境 GPU worker；验证自动切换标注稿、原文及时间戳保留、原稿指针保留和预测区间输出。
 - 实际 Qt 截图已检查，见 `artifacts/diarization_gui_preview.png`；机器结果 `artifacts/diarization_ui_check.json`。没有访问真实会议内容。
 - 模型返回三组编号，但后半段出现人物合并/编号变化。仅证明接入链路可运行，尚未验证真实会议准确率、长会议标签稳定性或实时逐人字幕。
+
+## 2026-10-02 continuous-meeting regression
+- Local evidence: the latest 84m30s meeting recorded zero gaps on both tracks. Live output contained 0 segments and `complete=false`, reason: backlog exceeded 30 seconds. The UI previously reported success despite this incomplete result.
+- Its 9B summary used 66 chunks; the previous request payload unloaded the model after every request. Requests now retain it for the task, with explicit CLI cleanup.
+- `python -m unittest discover -s tests -q`: 68 tests passed. Added concurrent capture controls, queued second session, exact source routing through processing stages, preview isolation, incomplete-live messaging, queue recovery, opt-out during live drain, and cold-start/sustained-backlog checks.
+- `scripts/render_background_preview.py`: isolated Qt layout rendered with an enabled recording button, queued meeting and circular processing icon. No microphone capture or model inference is launched by this preview.
+- No full-length GPU throughput benchmark was rerun; sustained device capture under concurrent model inference remains to be verified in a real meeting. Existing running app instances must be reopened to load these changes.
+- Follow-up: 69 tests passed after making full summary recomputation the default. A regression runs twice against existing cache files and verifies all input chunks, intermediate reductions and final output invoke generation again. Explicit `--reuse-cache` remains available; elapsed generation time is saved and displayed. These tests use mocked model responses, not a GPU speed benchmark.

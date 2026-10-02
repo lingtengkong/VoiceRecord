@@ -25,7 +25,7 @@ assert w.auto_transcribe.isChecked()
 assert not any(b.text() in ('下载模型','查看摘要','生成会后摘要') for b in w.findChildren(QPushButton))
 w.model_combo.setCurrentIndex(w.model_combo.findData('turbo'))
 w.summary_model.setCurrentIndex(w.summary_model.findData('qwen3.5:4b'))
-w.start_transcription()
+w.start_transcription(summarize_after=True)
 stages=[]
 deadline=time.monotonic()+300
 while w.process is not None and time.monotonic()<deadline:
