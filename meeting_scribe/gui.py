@@ -30,6 +30,15 @@ from .nemotron_stream import asr_path as nemotron_asr_path
 
 PROJECT = Path(__file__).resolve().parent.parent
 
+
+class AudioDeviceCombo(QComboBox):
+    def wheelEvent(self, event):
+        # Scrolling the settings pane must not change a live recording source.
+        if self.view().isVisible():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
 STYLE = """
 QWidget { font-family: 'Microsoft YaHei UI', 'Segoe UI'; font-size: 13px; color: #213348; }
 QMainWindow, #root { background: #f1f5f8; }
@@ -143,6 +152,8 @@ class MainWindow(QMainWindow):
         self.process_result = None
         self.process_folder = None
         self.stopping = False
+        self.silence_notified = False
+        self.silence_dialog = None
         self.live_process = None
         self.live_folder = None
         self.live_rows = []
@@ -230,7 +241,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.capture_hint)
         self.capture_mode.currentIndexChanged.connect(self.capture_mode_changed)
         layout.addWidget(label("我的麦克风", "muted"))
-        self.mic_combo = QComboBox()
+        self.mic_combo = AudioDeviceCombo()
+        self.mic_combo.activated.connect(lambda _index: self.change_recording_device('microphone'))
         self.mic_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         layout.addWidget(self.mic_combo)
         self.mic_meter = QProgressBar()
@@ -239,7 +251,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.mic_meter)
         self.system_label = label("会议声音 · 选择会议正在使用的耳机 / 扬声器", "muted")
         layout.addWidget(self.system_label)
-        self.system_combo = QComboBox()
+        self.system_combo = AudioDeviceCombo()
+        self.system_combo.activated.connect(lambda _index: self.change_recording_device('system'))
         self.system_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         layout.addWidget(self.system_combo)
         self.system_meter = QProgressBar()
@@ -248,6 +261,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.system_meter)
         self.device_hint = label("戴耳机可减少回声。会议声音会包含所选输出设备上的其他声音。", "hint")
         layout.addWidget(self.device_hint)
+        self.silence_hint = label("", "hint")
+        self.silence_hint.setWordWrap(True)
+        self.silence_hint.setStyleSheet("color: #b42318; font-weight: bold;")
+        self.silence_hint.hide()
+        layout.addWidget(self.silence_hint)
         clock_row = QHBoxLayout()
         self.clock = label("00:00:00", "timer")
         self.clock.setMinimumHeight(40)
@@ -430,6 +448,8 @@ class MainWindow(QMainWindow):
         self.refresh_history(preserve_preview=True)
 
     def refresh_devices(self):
+        if self.task or self.stopping:
+            return
         try:
             microphones, systems = list_devices()
             for combo, devices, key in ((self.mic_combo, microphones, "microphone"),
@@ -447,8 +467,42 @@ class MainWindow(QMainWindow):
                     selected = next((i for i, d in enumerate(devices) if d.default), 0)
                 combo.setCurrentIndex(selected)
             self.set_controls()
+            self.sync_recording_devices()
         except Exception as exc:
             self.show_error(f"无法枚举音频设备：{exc}")
+
+    def sync_recording_devices(self):
+        if not self.recorder:
+            return
+        for key, combo in (('microphone', self.mic_combo), ('system', self.system_combo)):
+            device = self.recorder.devices.get(key)
+            if device is None:
+                continue
+            index = next((i for i in range(combo.count()) if combo.itemData(i).name == device.name), -1)
+            if index < 0:
+                combo.addItem(device.name + '（当前设备）', device)
+                index = combo.count()-1
+            combo.setCurrentIndex(index)
+
+    def change_recording_device(self, key):
+        if not self.recorder:
+            return
+        if self.task or self.stopping or not self.recorder.active:
+            self.sync_recording_devices()
+            return
+        combo = self.mic_combo if key == 'microphone' else self.system_combo
+        device = combo.currentData()
+        if device is None or device == self.recorder.devices.get(key):
+            return
+        self.device_hint.setText('正在切换录音设备，已有录音保留…')
+        recorder = self.recorder
+        self.run_task(lambda: recorder.switch_device(key, device), self.recording_device_changed)
+
+    def recording_device_changed(self, _result):
+        self.sync_recording_devices()
+        self.save_settings()
+        self.silence_notified = False
+        self.device_hint.setText('录音设备已切换，请确认音量条有变化。切换时可能有短暂空白。')
 
     def capture_mode_changed(self, *_args):
         single = self.capture_mode.currentData() == 'microphone_only'
@@ -477,6 +531,9 @@ class MainWindow(QMainWindow):
 
     def task_failed(self, message):
         self.stopping = False
+        if self.recorder and self.recorder.active:
+            self.sync_recording_devices()
+            self.device_hint.setText(message)
         if self.recorder and not self.recorder.active:
             self.recorder = None
             self.record_state.setText("启动失败 · 请检查设备")
@@ -493,6 +550,7 @@ class MainWindow(QMainWindow):
     def start_recording(self):
         if self.recorder or self.task:
             return
+        self.silence_notified = False
         if self.live_process:
             self.cancel_process()
         self.maybe_auto_transcribe()
@@ -516,7 +574,7 @@ class MainWindow(QMainWindow):
         self.record_state.setText("● 正在录音")
         single = self.capture_mode.currentData() == 'microphone_only'
         self.device_hint.setText("请确认麦克风能收到自己和外放会议声音。" if single else "请确认两路音量条都有变化。暂停时不保存声音，续录后时间连续。")
-        self.statusBar().showMessage("录音中：仅保存麦克风混合声音。" if single else "录音中：原声与麦克风分别保存。请勿拔出或切换正在录音的设备。")
+        self.statusBar().showMessage("录音中：可通过上方下拉框更换音源；会议声音应选择会议软件实际使用的耳机或扬声器。")
         if self.process or self.job_queue or self.live_process:
             self.live_status.setText("后台正在处理上一会议，本次仅录音；结束后排队转写。")
         elif self.live_enabled.isChecked():
@@ -1095,6 +1153,10 @@ class MainWindow(QMainWindow):
         self.history.setEnabled(not recording and self.task is None)
         self.version_combo.setEnabled(not recording and self.task is None)
         self.system_combo.setEnabled(capture_idle and not single)
+        can_change_devices = self.task is None and not self.stopping
+        self.refresh_button.setEnabled(can_change_devices)
+        self.mic_combo.setEnabled(can_change_devices)
+        self.system_combo.setEnabled(can_change_devices and not single)
         self.system_meter.setEnabled(not single)
         self.transcribe_button.setEnabled(idle and self.selected is not None)
         self.summarize_button.setEnabled(idle and self.summary_source() is not None)
@@ -1106,6 +1168,7 @@ class MainWindow(QMainWindow):
             widget.setEnabled(idle and (self.summary_folder() is not None if self.version_combo.currentData() == 'summary' else self.transcript_folder() is not None))
 
     def tick(self):
+        self.check_recording_silence()
         self.update_job_indicators()
         model = self.model_combo.currentData()
         self.model_status.setText(f'{model}  ·  ' + ("本地模型已就绪" if model_ready(model) else "尚未下载，首次下载需要联网"))
@@ -1130,6 +1193,37 @@ class MainWindow(QMainWindow):
             self.system_meter.setValue(0)
         if self.live_process and time.monotonic()-self.live_last_event > 12:
             self.live_status.setText("实时识别响应较慢，录音仍独立保存；可停止实时预览后会后重转。")
+
+    def check_recording_silence(self):
+        recorder = self.recorder
+        if not recorder or not recorder.active or self.stopping or recorder.paused:
+            self.silence_hint.hide()
+            if self.silence_dialog:
+                self.silence_dialog.close()
+            return
+        if recorder.silence_seconds() < 30:
+            self.silence_notified = False
+            self.silence_hint.hide()
+            if self.silence_dialog:
+                self.silence_dialog.close()
+            return
+        key = 'system' if 'system' in recorder.devices else 'microphone'
+        source = '会议声音（扬声器／耳机）' if key == 'system' else '麦克风'
+        message = (f"{source}已连续 30 秒未检测到明显声音。请检查所选设备，"
+                   "确认对应音量条有变化。录音仍在继续。\n当前音源：" + recorder.devices[key].name)
+        self.silence_hint.setText(message)
+        self.silence_hint.show()
+        if self.silence_notified:
+            return
+        self.silence_notified = True
+        if self.silence_dialog is None:
+            self.silence_dialog = QMessageBox(QMessageBox.Icon.Warning, "录音未检测到声音", "",
+                                             QMessageBox.StandardButton.Ok, self)
+            self.silence_dialog.setTextFormat(Qt.TextFormat.PlainText)
+            self.silence_dialog.setModal(False)
+        self.silence_dialog.setText(message)
+        self.silence_dialog.show()
+        QApplication.alert(self, 5000)
 
     def start_live(self):
         self.live_folder = self.active_session

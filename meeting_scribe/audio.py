@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pyaudiowpatch as pa
 import soundfile as sf
+from scipy.signal import resample_poly
 
 from .storage import atomic_json, read_json
 
@@ -168,6 +169,10 @@ class Recorder:
             self.devices['system'] = system
         self.engine = None
         self.streams = {}
+        self.stream_gates = {}
+        self.extra_engines = {}
+        self.switching = set()
+        self.callback_locks = {key: threading.Lock() for key in self.devices}
         self.writers = {}
         self.levels = {"microphone": 0., "system": 0.}
         self.last_signal = {"microphone": 0., "system": 0.}
@@ -201,11 +206,13 @@ class Recorder:
                 if current["name"] != device.name or bool(current.get("isLoopbackDevice")) != device.loopback:
                     raise RuntimeError("音频设备已变化，请刷新设备并重新选择。")
                 self.writers[key] = TrackWriter(self.folder / f"{key}.wav", device.rate, self.fail)
+                self.stream_gates[key] = threading.Event()
+                self.stream_gates[key].set()
                 self.streams[key] = self.engine.open(
                     format=pa.paFloat32, channels=device.channels, rate=device.rate,
                     input=True, input_device_index=device.index,
                     frames_per_buffer=max(256, device.rate // 20), start=False,
-                    stream_callback=self._callback(key, device),
+                    stream_callback=self._callback(key, device, self.stream_gates[key]),
                 )
             self.timeline = Timeline()
             self.accepting = True
@@ -221,8 +228,76 @@ class Recorder:
             self.stop(create_mix=False)
             raise
 
-    def _callback(self, key: str, device: Device):
-        def callback(data, count, timing, flags):
+    def switch_device(self, key: str, device: Device):
+        """Open the replacement first; retain writers, timeline and the other stream."""
+        if not self.active or key not in self.devices or self.switching:
+            raise RuntimeError("当前无法切换设备，请等待录音操作完成。")
+        old_device = self.devices[key]
+        if device == old_device:
+            return
+        if device.loopback != (key == 'system'):
+            raise ValueError("设备类型与录音音轨不匹配。")
+        self.switching.add(key)
+        engine, stream = None, None
+        gate = threading.Event()
+        started = self.timeline.position()
+        committed = False
+        try:
+            engine = pa.PyAudio()
+            current = engine.get_device_info_by_index(device.index)
+            if current['name'] != device.name or bool(current.get('isLoopbackDevice')) != device.loopback:
+                raise RuntimeError("音频设备已变化，请刷新后重新选择。")
+            stream = engine.open(format=pa.paFloat32, channels=device.channels, rate=device.rate,
+                                 input=True, input_device_index=device.index,
+                                 frames_per_buffer=max(256, device.rate//20), start=False,
+                                 stream_callback=self._callback(key, device, gate))
+            stream.start_stream()
+            if not stream.is_active():
+                raise RuntimeError("新设备未能启动。")
+            old_stream = self.streams[key]
+            old_engine = self.extra_engines.get(key)
+            old_gate = self.stream_gates[key]
+            with self.callback_locks[key]:
+                old_gate.clear()
+                self.streams[key] = stream
+                self.stream_gates[key] = gate
+                self.extra_engines[key] = engine
+                self.devices[key] = device
+                self.levels[key] = 0.
+                self.last_callback[key] = time.monotonic()
+                committed = True
+                gate.set()
+            self.meta['devices'] = {k: vars(d) for k, d in self.devices.items()}
+            self.meta.setdefault('device_changes', []).append(dict(
+                track=key, requested_at=started, position=self.timeline.position(),
+                previous=vars(old_device), current=vars(device), track_rate=self.writers[key].rate))
+            try:
+                if old_stream.is_active():
+                    old_stream.stop_stream()
+                old_stream.close()
+            finally:
+                if old_engine:
+                    old_engine.terminate()
+            atomic_json(self.folder / 'session.json', self.meta)
+            self.publish_live()
+        except Exception as exc:
+            if not committed:
+                if stream:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                if engine:
+                    engine.terminate()
+                raise RuntimeError(f"切换失败，原设备继续录音：{exc}") from exc
+            raise RuntimeError(f"新设备已启用，但旧设备清理或切换记录保存失败：{exc}") from exc
+        finally:
+            self.switching.discard(key)
+
+    def _callback(self, key: str, device: Device, gate=None):
+        def process_block(data, count, timing, flags):
+            if gate is not None and not gate.is_set():
+                return (None, pa.paContinue)
             self.last_callback[key] = time.monotonic()
             if flags:
                 self.status_flags[key] += 1
@@ -239,11 +314,20 @@ class Recorder:
                 if not (0 <= latency < 2) or timing.get("input_buffer_adc_time", 0) <= 0:
                     latency = count / device.rate
                 position = self.timeline.position(now - latency)
+                target_rate = self.writers[key].rate
+                if device.rate != target_rate:
+                    divisor = math.gcd(device.rate, target_rate)
+                    samples = resample_poly(samples, target_rate//divisor, device.rate//divisor)
+                if gate is not None and not gate.is_set():
+                    return (None, pa.paContinue)
                 self.writers[key].push(position, samples.copy())
             except Exception as exc:
                 self.fail(f"音频采集失败：{exc}")
                 return (None, pa.paAbort)
             return (None, pa.paContinue)
+        def callback(data, count, timing, flags):
+            with self.callback_locks[key]:
+                return process_block(data, count, timing, flags)
         return callback
 
     def pause(self):
@@ -284,11 +368,15 @@ class Recorder:
         if time.monotonic() - self.last_live >= .5:
             self.last_live = time.monotonic()
             self.publish_live()
-        for key, stream in self.streams.items():
-            if time.monotonic() - self.last_callback[key] > .3:
-                self.levels[key] = 0.
-            if not stream.is_active():
-                self.fail(f"{'麦克风' if key == 'microphone' else '会议声音'}设备已停止响应。录音将保存，请重新选择设备。")
+        for key in self.streams:
+            with self.callback_locks[key]:
+                if key in self.switching:
+                    continue
+                stream = self.streams[key]
+                if time.monotonic() - self.last_callback[key] > .3:
+                    self.levels[key] = 0.
+                if not stream.is_active():
+                    self.fail(f"{'麦克风' if key == 'microphone' else '会议声音'}设备已停止响应。录音将保存，请重新选择设备。")
         if time.monotonic() - self.last_save >= 3:
             self.last_save = time.monotonic()
             if shutil.disk_usage(self.folder).free < 256 * 1024**2:
@@ -297,6 +385,15 @@ class Recorder:
                 self.fail("本次录音已达到 8 小时，请开始新会议。")
             self.meta.update(duration=self.timeline.position(), status="paused" if self.paused else "recording")
             atomic_json(self.folder / "session.json", self.meta)
+
+    def silence_seconds(self) -> float:
+        """Silence on meeting audio (or sole microphone), excluding paused time."""
+        if not self.active or self.paused:
+            return 0.
+        key = 'system' if 'system' in self.devices else 'microphone'
+        last = self.last_signal[key]
+        last_position = self.timeline.position(last) if last else 0.
+        return max(0., self.timeline.position() - last_position)
 
     def stop(self, create_mix=True) -> dict:
         duration = self.timeline.position()
@@ -311,6 +408,9 @@ class Recorder:
             except Exception as exc:
                 self.fail(str(exc))
         self.streams.clear()
+        for engine in self.extra_engines.values():
+            engine.terminate()
+        self.extra_engines.clear()
         if self.engine:
             self.engine.terminate()
             self.engine = None
