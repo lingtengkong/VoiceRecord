@@ -15,6 +15,8 @@ if errorlevel 1 goto fail
 if errorlevel 1 goto fail
 "%ROOT%\runtime\Scripts\python.exe" download_model.py turbo
 if errorlevel 1 goto fail
+"%ROOT%\runtime\Scripts\python.exe" download_translation.py
+if errorlevel 1 goto fail
 echo Setup complete. Open Start.cmd.
 pause
 exit /b 0

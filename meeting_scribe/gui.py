@@ -23,6 +23,7 @@ from .storage import data_root, new_session, read_json, atomic_json, sessions, t
 from .storage import recordings_root, set_recordings_root, rename_session, delete_session
 from .transcription import MODELS, model_ready, export_transcript
 from .transcript_view import TranscriptView
+from .translation_dialog import TranslationDialog, TranslationService
 from .playback import Playback
 from .diarization import runtime_path as diarization_runtime, model_path as diarization_model
 from .diarization import save_manual
@@ -143,6 +144,8 @@ class MainWindow(QMainWindow):
         self.task = None
         self.process = None
         self.process_kind = ""
+        self.translation_service = TranslationService(self)
+        self.translation_popup = None
         self.selected = None
         self.active_session = None
         self.process_buffer = ""
@@ -387,9 +390,8 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(preview, 3)
         layout.addWidget(label("03  转写与摘要", "section"))
         self.version_combo = QComboBox()
-        self.version_combo.addItem("会后稿（优先）", "final")
+        self.version_combo.addItem("会后稿（说话者标注）", "speakers")
         self.version_combo.addItem("实时草稿", "live")
-        self.version_combo.addItem("说话者标注稿（待核对）", "speakers")
         self.version_combo.addItem("会后摘要", "summary")
         self.version_combo.currentIndexChanged.connect(self.show_selected_transcript)
         version_row = QHBoxLayout()
@@ -400,6 +402,8 @@ class MainWindow(QMainWindow):
             self.preview.verticalScrollBar().maximum())))
         layout.addLayout(version_row)
         self.preview = TranscriptView()
+        self.preview.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.preview.customContextMenuRequested.connect(self.preview_menu)
         self.preview.setReadOnly(True)
         self.preview.setPlaceholderText("转写完成后，在这里查看带时间戳的文字。\n\n保留音源标签：\n• 我 / 麦克风\n• 会议声音（可能包含多位参会者）\n\n复制纪要素材前，可先检查或删除敏感内容。")
         layout.addWidget(self.preview, 1)
@@ -501,7 +505,6 @@ class MainWindow(QMainWindow):
     def recording_device_changed(self, _result):
         self.sync_recording_devices()
         self.save_settings()
-        self.silence_notified = False
         self.device_hint.setText('录音设备已切换，请确认音量条有变化。切换时可能有短暂空白。')
 
     def capture_mode_changed(self, *_args):
@@ -834,7 +837,7 @@ class MainWindow(QMainWindow):
 
     def transcript_folder(self):
         if self.selected:
-            filenames = (["latest_speaker_transcript.json"] if self.version_combo.currentData() == "speakers"
+            filenames = (["latest_speaker_transcript.json", "latest_transcript.json"] if self.version_combo.currentData() == "speakers"
                          else ["latest_live_transcript.json"] if self.version_combo.currentData() == "live"
                          else ["latest_transcript.json", "latest_live_transcript.json"])
             value = next((read_json(self.selected / filename).get("path") for filename in filenames
@@ -860,7 +863,7 @@ class MainWindow(QMainWindow):
         self.process_folder = target
         self.batch_rows = []
         if not self.recorder and self.selected == target:
-            self.version_combo.setCurrentIndex(0)
+            self.version_combo.setCurrentIndex(self.version_combo.findData("speakers"))
             self.preview.clear()
         args = ["-m", "meeting_scribe.transcription", str(target), "--model", model,
                 "--language", self.job_options["language"], "--device", self.job_options["device"],
@@ -1036,7 +1039,7 @@ class MainWindow(QMainWindow):
                 self.progress.setValue(event["value"])
             elif kind == "segment":
                 self.batch_rows.append(event)
-                if not self.recorder and self.selected == self.process_folder and self.version_combo.currentData() == "final":
+                if not self.recorder and self.selected == self.process_folder and self.version_combo.currentData() == "speakers":
                     self.preview.update_rows(self.batch_rows, note="正在生成会后转写稿")
             elif kind == "error":
                 self.process_errors += event["message"] + "\n"
@@ -1076,7 +1079,7 @@ class MainWindow(QMainWindow):
                 if visible:
                     self.version_combo.setCurrentIndex(self.version_combo.findData('summary'))
             if kind == "diarize":
-                self.job_status.setText("说话者标注稿已保存；编号可能变化，请核对。")
+                self.job_status.setText("会后稿（说话者标注）已保存；编号可能变化，请核对。")
                 if visible:
                     self.version_combo.setCurrentIndex(self.version_combo.findData("speakers"))
                 continue_summary = self.summarize_after_transcription
@@ -1201,15 +1204,15 @@ class MainWindow(QMainWindow):
             if self.silence_dialog:
                 self.silence_dialog.close()
             return
-        if recorder.silence_seconds() < 30:
-            self.silence_notified = False
+        key = 'system' if 'system' in recorder.devices else 'microphone'
+        # Startup check only: once this meeting has received sound, later silence is normal.
+        if recorder.last_signal[key] > 0 or recorder.silence_seconds() < 30:
             self.silence_hint.hide()
             if self.silence_dialog:
                 self.silence_dialog.close()
             return
-        key = 'system' if 'system' in recorder.devices else 'microphone'
         source = '会议声音（扬声器／耳机）' if key == 'system' else '麦克风'
-        message = (f"{source}已连续 30 秒未检测到明显声音。请检查所选设备，"
+        message = (f"录音已开始 30 秒，{source}仍未检测到明显声音。请检查所选设备，"
                    "确认对应音量条有变化。录音仍在继续。\n当前音源：" + recorder.devices[key].name)
         self.silence_hint.setText(message)
         self.silence_hint.show()
@@ -1227,7 +1230,7 @@ class MainWindow(QMainWindow):
 
     def start_live(self):
         self.live_folder = self.active_session
-        self.version_combo.setCurrentIndex(1)
+        self.version_combo.setCurrentIndex(self.version_combo.findData("live"))
         self.preview.clear()
         self.live_result = None
         self.live_errors = ""
@@ -1369,6 +1372,35 @@ class MainWindow(QMainWindow):
         if path:
             self.open_path(path)
 
+    def preview_menu(self, position):
+        text = self.preview.textCursor().selectedText().replace('\u2029', '\n').replace('\u2028', '\n').strip()
+        menu = self.preview.createStandardContextMenu()
+        menu.addSeparator()
+        action = menu.addAction('翻译为中文')
+        action.setEnabled(bool(text))
+        action.triggered.connect(lambda: self.translate_selection(text, self.preview.viewport().mapToGlobal(position)))
+        menu.exec(self.preview.viewport().mapToGlobal(position))
+        menu.deleteLater()
+
+    def translate_selection(self, text, position=None):
+        from .translation import MAX_TEXT
+        if len(text) > MAX_TEXT:
+            self.show_error('单次最多翻译6000个字符，请缩小选择范围。')
+            return
+        if not text.strip():
+            return
+        if self.translation_popup is not None:
+            self.translation_popup.close()
+        position = position or self.preview.mapToGlobal(self.preview.rect().center())
+        self.translation_popup = TranslationDialog(text, self.translation_service, position, self)
+        popup = self.translation_popup
+        popup.destroyed.connect(lambda: self.clear_translation_popup(popup))
+        self.translation_popup.show()
+
+    def clear_translation_popup(self, popup):
+        if self.translation_popup is popup:
+            self.translation_popup = None
+
     def copy_summary(self):
         if self.version_combo.currentData() == 'summary':
             folder = self.summary_folder()
@@ -1385,6 +1417,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "仍有任务在运行", "请先结束并保存录音，或取消当前转写 / 下载，再关闭窗口。")
             event.ignore()
             return
+        self.translation_service.stop()
         self.save_settings()
         self.playback.player.stop()
         event.accept()

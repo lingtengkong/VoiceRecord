@@ -63,7 +63,7 @@ class SilenceWarningTests(unittest.TestCase):
         self.recorder.last_signal['microphone'] = 129.
         self.assertEqual(self.recorder.silence_seconds(), 1.)
 
-    def test_modeless_warning_once_per_silent_period_and_recording_continues(self):
+    def test_modeless_warning_once_at_start_and_no_repeat_after_sound(self):
         with patch.object(gui.MainWindow, 'refresh_devices'):
             w = gui.MainWindow(recover_sessions=False)
         w.timer.stop()
@@ -91,11 +91,35 @@ class SilenceWarningTests(unittest.TestCase):
             self.assertTrue(w.silence_hint.isHidden())
             self.now.return_value = 220.
             w.check_recording_silence()
-            self.assertTrue(w.silence_dialog.isVisible())
+            self.assertFalse(w.silence_dialog.isVisible())
+            self.assertTrue(w.silence_hint.isHidden())
+            w.recording_device_changed(None)
+            self.now.return_value = 400.
+            w.check_recording_silence()
+            self.assertFalse(w.silence_dialog.isVisible())
             self.recorder.paused = True
             w.check_recording_silence()
             self.assertFalse(w.silence_dialog.isVisible())
             self.assertTrue(w.silence_hint.isHidden())
+        finally:
+            w.recorder = None
+            w.close()
+
+    def test_sound_at_start_disables_warning_for_rest_of_meeting(self):
+        with patch.object(gui.MainWindow, 'refresh_devices'):
+            w = gui.MainWindow(recover_sessions=False)
+        w.timer.stop()
+        w.recorder = self.recorder
+        try:
+            self.recorder.last_signal['system'] = 105.
+            self.now.return_value = 400.
+            w.check_recording_silence()
+            self.assertIsNone(w.silence_dialog)
+            self.assertTrue(w.silence_hint.isHidden())
+            self.recorder.devices = {'microphone': self.mic}
+            self.recorder.last_signal['microphone'] = 105.
+            w.check_recording_silence()
+            self.assertIsNone(w.silence_dialog)
         finally:
             w.recorder = None
             w.close()
