@@ -156,6 +156,7 @@ class MainWindow(QMainWindow):
         self.process_folder = None
         self.stopping = False
         self.silence_notified = False
+        self.long_silence_episode = None
         self.silence_dialog = None
         self.live_process = None
         self.live_folder = None
@@ -554,6 +555,7 @@ class MainWindow(QMainWindow):
         if self.recorder or self.task:
             return
         self.silence_notified = False
+        self.long_silence_episode = None
         if self.live_process:
             self.cancel_process()
         self.maybe_auto_transcribe()
@@ -1205,20 +1207,33 @@ class MainWindow(QMainWindow):
                 self.silence_dialog.close()
             return
         key = 'system' if 'system' in recorder.devices else 'microphone'
-        # Startup check only: once this meeting has received sound, later silence is normal.
-        if recorder.last_signal[key] > 0 or recorder.silence_seconds() < 30:
+        silence = recorder.silence_seconds()
+        opening_warning = recorder.last_signal[key] == 0 and silence >= 30
+        long_warning = silence >= 300
+        if not opening_warning and not long_warning:
             self.silence_hint.hide()
             if self.silence_dialog:
                 self.silence_dialog.close()
             return
         source = '会议声音（扬声器／耳机）' if key == 'system' else '麦克风'
-        message = (f"录音已开始 30 秒，{source}仍未检测到明显声音。请检查所选设备，"
-                   "确认对应音量条有变化。录音仍在继续。\n当前音源：" + recorder.devices[key].name)
+        episode = (key, recorder.last_signal[key])
+        if long_warning:
+            message = (f"{source}已连续 5 分钟未检测到明显声音。会议是否已经结束？"
+                       "如已结束，请点击“结束并保存”；否则请检查所选音源。"
+                       "录音仍在继续。\n当前音源：" + recorder.devices[key].name)
+            already_notified = self.long_silence_episode == episode
+        else:
+            message = (f"录音已开始 30 秒，{source}仍未检测到明显声音。请检查所选设备，"
+                       "确认对应音量条有变化。录音仍在继续。\n当前音源：" + recorder.devices[key].name)
+            already_notified = self.silence_notified
         self.silence_hint.setText(message)
         self.silence_hint.show()
-        if self.silence_notified:
+        if already_notified:
             return
-        self.silence_notified = True
+        if long_warning:
+            self.long_silence_episode = episode
+        else:
+            self.silence_notified = True
         if self.silence_dialog is None:
             self.silence_dialog = QMessageBox(QMessageBox.Icon.Warning, "录音未检测到声音", "",
                                              QMessageBox.StandardButton.Ok, self)
@@ -1226,6 +1241,9 @@ class MainWindow(QMainWindow):
             self.silence_dialog.setModal(False)
         self.silence_dialog.setText(message)
         self.silence_dialog.show()
+        if long_warning:
+            self.silence_dialog.raise_()
+            QApplication.beep()
         QApplication.alert(self, 5000)
 
     def start_live(self):

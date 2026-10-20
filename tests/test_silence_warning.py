@@ -105,7 +105,7 @@ class SilenceWarningTests(unittest.TestCase):
             w.recorder = None
             w.close()
 
-    def test_sound_at_start_disables_warning_for_rest_of_meeting(self):
+    def test_sound_at_start_suppresses_opening_warning_before_five_minutes(self):
         with patch.object(gui.MainWindow, 'refresh_devices'):
             w = gui.MainWindow(recover_sessions=False)
         w.timer.stop()
@@ -120,6 +120,90 @@ class SilenceWarningTests(unittest.TestCase):
             self.recorder.last_signal['microphone'] = 105.
             w.check_recording_silence()
             self.assertIsNone(w.silence_dialog)
+        finally:
+            w.recorder = None
+            w.close()
+
+    def test_five_minute_boundary_once_per_silence_and_rearm_after_sound(self):
+        for microphone_only in (False, True):
+            with self.subTest(microphone_only=microphone_only):
+                self.recorder.devices = ({'microphone': self.mic} if microphone_only else
+                                         {'microphone': self.mic, 'system': self.system})
+                key = 'microphone' if microphone_only else 'system'
+                self.recorder.last_signal[key] = 105.
+                with patch.object(gui.MainWindow, 'refresh_devices'), patch.object(gui.QApplication, 'beep') as beep:
+                    w = gui.MainWindow(recover_sessions=False)
+                    w.timer.stop()
+                    w.recorder = self.recorder
+                    try:
+                        self.now.return_value = 404.9
+                        w.check_recording_silence()
+                        self.assertIsNone(w.silence_dialog)
+                        self.now.return_value = 405.
+                        w.check_recording_silence()
+                        self.assertTrue(w.silence_dialog.isVisible())
+                        self.assertIn('连续 5 分钟', w.silence_dialog.text())
+                        self.assertFalse(w.silence_dialog.isModal())
+                        self.assertTrue(self.recorder.active)
+                        beep.assert_called_once()
+                        w.silence_dialog.accept()
+                        self.now.return_value = 1000.
+                        w.check_recording_silence()
+                        self.assertFalse(w.silence_dialog.isVisible())
+                        self.assertEqual(beep.call_count, 1)
+                        # Sound can arrive between GUI polls; it must re-arm the alert.
+                        self.recorder.last_signal[key] = 1001.
+                        self.now.return_value = 1301.
+                        w.check_recording_silence()
+                        self.assertTrue(w.silence_dialog.isVisible())
+                        self.assertEqual(beep.call_count, 2)
+                    finally:
+                        w.recorder = None
+                        w.close()
+
+    def test_opening_warning_escalates_at_five_minutes(self):
+        with patch.object(gui.MainWindow, 'refresh_devices'), patch.object(gui.QApplication, 'beep'):
+            w = gui.MainWindow(recover_sessions=False)
+        w.timer.stop()
+        w.recorder = self.recorder
+        try:
+            self.now.return_value = 130.
+            w.check_recording_silence()
+            w.silence_dialog.accept()
+            self.now.return_value = 399.9
+            w.check_recording_silence()
+            self.assertFalse(w.silence_dialog.isVisible())
+            self.now.return_value = 400.
+            with patch.object(gui.QApplication, 'beep'):
+                w.check_recording_silence()
+            self.assertTrue(w.silence_dialog.isVisible())
+            self.assertIn('连续 5 分钟', w.silence_dialog.text())
+        finally:
+            w.recorder = None
+            w.close()
+
+    def test_five_minute_warning_excludes_pause_time(self):
+        with patch.object(gui.MainWindow, 'refresh_devices'):
+            w = gui.MainWindow(recover_sessions=False)
+        w.timer.stop()
+        w.recorder = self.recorder
+        try:
+            self.recorder.last_signal['system'] = 105.
+            self.now.return_value = 205.
+            self.recorder.timeline.pause()
+            self.recorder.paused = True
+            self.now.return_value = 1205.
+            w.check_recording_silence()
+            self.assertIsNone(w.silence_dialog)
+            self.recorder.timeline.resume()
+            self.recorder.paused = False
+            self.now.return_value = 1404.9
+            w.check_recording_silence()
+            self.assertIsNone(w.silence_dialog)
+            self.now.return_value = 1405.
+            with patch.object(gui.QApplication, 'beep'):
+                w.check_recording_silence()
+            self.assertTrue(w.silence_dialog.isVisible())
         finally:
             w.recorder = None
             w.close()
