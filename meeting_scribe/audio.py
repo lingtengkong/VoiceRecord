@@ -7,14 +7,22 @@ import threading
 import time
 import wave
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import pyaudiowpatch as pa
 import soundfile as sf
-from scipy.signal import resample_poly
 
 from .storage import atomic_json, read_json
+
+
+@lru_cache(maxsize=1)
+def _resampler():
+    # Most sessions keep the device's native sample rate. Do not load all of
+    # scipy.signal just to display the window or begin native-rate recording.
+    from scipy.signal import resample_poly
+    return resample_poly
 
 
 @dataclass
@@ -243,6 +251,10 @@ class Recorder:
         started = self.timeline.position()
         committed = False
         try:
+            if device.rate != self.writers[key].rate:
+                # Load before enabling the replacement stream, never for the
+                # first time in its real-time audio callback.
+                _resampler()
             engine = pa.PyAudio()
             current = engine.get_device_info_by_index(device.index)
             if current['name'] != device.name or bool(current.get('isLoopbackDevice')) != device.loopback:
@@ -317,7 +329,7 @@ class Recorder:
                 target_rate = self.writers[key].rate
                 if device.rate != target_rate:
                     divisor = math.gcd(device.rate, target_rate)
-                    samples = resample_poly(samples, target_rate//divisor, device.rate//divisor)
+                    samples = _resampler()(samples, target_rate//divisor, device.rate//divisor)
                 if gate is not None and not gate.is_set():
                     return (None, pa.paContinue)
                 self.writers[key].push(position, samples.copy())

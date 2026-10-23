@@ -6,10 +6,10 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["DO_NOT_TRACK"] = "1"
 
 from PySide6.QtCore import QLockFile
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 from meeting_scribe.storage import data_root
-from meeting_scribe.branding import APP_NAME, ICON_PATH, WINDOWS_APP_ID
+from meeting_scribe.branding import APP_NAME, WINDOWS_APP_ID
+from meeting_scribe.recording_icon import logo_icon
 
 
 def main():
@@ -18,7 +18,7 @@ def main():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    app.setWindowIcon(QIcon(str(ICON_PATH)))
+    app.setWindowIcon(logo_icon())
     app.setOrganizationName("LocalMeetingScribe")
     lock = QLockFile(str(data_root() / "app.lock"))
     lock.setStaleLockTime(0)

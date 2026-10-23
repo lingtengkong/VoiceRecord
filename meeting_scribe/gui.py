@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (
 )
 
 from .audio import Recorder, list_devices, recover_session
-from .branding import ICON_PATH, WINDOW_TITLE
+from .branding import WINDOW_TITLE
+from .recording_icon import RecordingIcon
 from .summary import session_summary, summary_headline
 from .storage import data_root, new_session, read_json, atomic_json, sessions, timestamp
 from .storage import recordings_root, set_recordings_root, rename_session, delete_session
@@ -137,7 +138,7 @@ class MainWindow(QMainWindow):
                 QFontDatabase.addApplicationFont(str(path))
         QApplication.instance().setFont(QFont("Microsoft YaHei", 10))
         self.setWindowTitle(WINDOW_TITLE)
-        self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self.recording_icon = RecordingIcon(self)
         self.resize(1180, 920)
         self.setMinimumSize(1000, 760)
         self.recorder = None
@@ -576,6 +577,7 @@ class MainWindow(QMainWindow):
         self.run_task(self.recorder.start, self.recording_started)
 
     def recording_started(self, _):
+        self.update_recording_icon()
         self.record_state.setText("● 正在录音")
         single = self.capture_mode.currentData() == 'microphone_only'
         self.device_hint.setText("请确认麦克风能收到自己和外放会议声音。" if single else "请确认两路音量条都有变化。暂停时不保存声音，续录后时间连续。")
@@ -604,11 +606,13 @@ class MainWindow(QMainWindow):
             self.recorder.pause()
             self.pause_button.setText("继续")
             self.record_state.setText("已暂停")
+        self.update_recording_icon()
 
     def stop_recording(self):
         if not self.recorder or self.stopping or self.task:
             return
         self.stopping = True
+        self.update_recording_icon()
         self.record_state.setText("正在保存…")
         self.run_task(self.recorder.stop, self.recording_saved)
 
@@ -1133,6 +1137,7 @@ class MainWindow(QMainWindow):
             self.process.kill()
 
     def set_controls(self):
+        self.update_recording_icon()
         recording = self.recorder is not None
         busy = self.task is not None or self.process is not None
         capture_idle = not recording and self.task is None
@@ -1173,6 +1178,7 @@ class MainWindow(QMainWindow):
             widget.setEnabled(idle and (self.summary_folder() is not None if self.version_combo.currentData() == 'summary' else self.transcript_folder() is not None))
 
     def tick(self):
+        self.update_recording_icon()
         self.check_recording_silence()
         self.update_job_indicators()
         model = self.model_combo.currentData()
@@ -1198,6 +1204,11 @@ class MainWindow(QMainWindow):
             self.system_meter.setValue(0)
         if self.live_process and time.monotonic()-self.live_last_event > 12:
             self.live_status.setText("实时识别响应较慢，录音仍独立保存；可停止实时预览后会后重转。")
+
+    def update_recording_icon(self):
+        self.recording_icon.set_recording(bool(
+            self.recorder and self.recorder.active and not self.recorder.paused
+            and not self.stopping and not self.recorder.error))
 
     def check_recording_silence(self):
         recorder = self.recorder
